@@ -70,3 +70,55 @@ uv run pytest
 uv run python -m findex.stats data/ --limit 100
 uv run python -m findex.stats data/ --compare-eager
 ~~~
+
+---
+
+## Lab 02 — The Inverted Index: Dictionaries, Hashing, and Memory
+
+### What was built
+- **`src/findex/index.py`**: immutable, hashable `@dataclass(frozen=True, slots=True)` records (`Posting`, `DocMeta`) and `build_index()` that consumes the Lab 1 lazy stream in a single pass using `defaultdict(list)` and per-document `Counter` flushing. Because `doc_id`s arrive in strictly increasing order, every postings list is naturally sorted by `doc_id`. Supports optional `--positions` for Lab 3 phrase search.
+- **`src/findex/search.py`**: Boolean query evaluation (`AND`, `OR`, `NOT`, implicit `AND`) with two interchangeable backends: `--engine merge` (two-pointer linear merge on sorted postings) and `--engine set` (Python `set` operations).
+- **`src/findex/store.py`**: persistence in two formats — `pickle` (for trusted local files only) and a safe, compact `binary` format (JSON metadata header + contiguous little-endian `array('I')` buffers).
+- **`tests/test_index.py`**: 8 pytest tests verifying dataclass hashing/immutability/slots, sorted postings with and without positions, merge correctness, merge-vs-set equivalence, and save/load round trips for both formats.
+
+### M2: Two-pointer merge vs. `set` benchmark
+
+| Pair | Terms (df) | Op | Merge (µs) | Set (µs) | Winner |
+|---|---|---|---|---|---|
+| Most common | `the` (4,981), `of` (4,931) | AND | 1248.07 | 1193.59 | set |
+| Most common | `the` (4,981), `of` (4,931) | OR | 1274.58 | 1080.87 | set |
+| Rare | `gallium` (2), `maigmo` (2) | AND | 0.80 | 0.77 | set |
+| Rare | `gallium` (2), `maigmo` (2) | OR | 1.05 | 0.89 | set |
+
+Although two-pointer merge has $O(n + m)$ asymptotic complexity without hashing or sorting, Python's built-in `set` intersection/union and `sorted()` (Timsort) execute entirely in compiled C, outperforming a pure-Python `while` loop on lists up to ~5,000 IDs. Two-pointer merge remains essential for streaming/compressed postings and extends directly to positional phrase queries in Lab 3.
+
+### M3: Persistence formats & `--positions` cost
+
+| Format | Positions | File size (MiB) | Save (s) | Load (s) |
+|---|---|---|---|---|
+| pickle | no | 27.60 | 10.076 | 12.346 |
+| binary (`array('I')`) | no | 14.68 | 0.741 | 4.606 |
+| pickle | yes | 39.11 | 13.637 | 11.228 |
+| binary (`array('I')`) | yes | 29.10 | 1.684 | 6.322 |
+
+- The custom `binary` format is **1.88× smaller** on disk (without positions), **13.6× faster to save**, and **2.7× faster to load** than `pickle`.
+- Storing token positions roughly doubles the binary index on disk (14.68 MiB → 29.10 MiB) and increases build peak RAM to ~335 MiB due to per-posting position tuples, unlocking phrase queries in Lab 3.
+- **Security note on `pickle`**: `pickle.load()` is a remote-code-execution (RCE) vulnerability on untrusted input because pickled payloads can invoke arbitrary callables via `__reduce__`. In `findex`, `pickle` is restricted to locally generated files only; the `binary` format parses only JSON metadata and raw `uint32` arrays, eliminating code-execution risk.
+
+### M4: Memory study (`tracemalloc`, full 5,000-document corpus, no positions)
+
+| Postings representation | Peak memory (build) | Index file size | Load time |
+|---|---|---|---|
+| `list[Posting]` with plain `@dataclass` | 173.34 MiB | 31.98 MiB | 1.998 s |
+| `list[Posting]` with `slots=True` | 122.24 MiB | 27.19 MiB | 8.601 s |
+| `array('I')` pairs `(doc_ids, tfs)` — no objects | 48.96 MiB | 18.64 MiB | 0.382 s |
+
+Across the 5,000-document corpus, the index contains over a million `(doc_id, tf)` postings. With a plain `@dataclass`, every `Posting` allocates a per-instance `__dict__` hash table (~100+ bytes of overhead on top of the object header and two integer references), pushing peak build RAM to **173.34 MiB**. Adding `slots=True` eliminates per-instance dictionaries in favor of fixed C-level struct slots, dropping peak RAM by **51.1 MiB (~1.42× smaller)** to **122.24 MiB**. Replacing `Posting` objects with parallel `array('I')` buffers removes both Python object headers and boxed 28-byte `PyLongObject` integers, packing each `(doc_id, tf)` pair into just 8 contiguous bytes — cutting peak RAM to **48.96 MiB (3.54× smaller than plain dataclasses)** and loading in **0.382 s** (avoiding reconstructing over a million Python objects).
+
+### Running Lab 02
+
+~~~bash
+uv run python -m findex.index data/ --out data/index.bin --positions
+uv run python -m findex.search data/index.bin "python programming"
+uv run python -m findex.search data/index.bin "ukraine NOT russia" --engine set --limit 5
+~~~
