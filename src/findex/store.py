@@ -1,39 +1,43 @@
-"""Index persistence in two formats: pickle and compact array('I') binary (Lab 2, M3)."""
+"""Index persistence (pickle + compact binary) and open_index context manager."""
 
 import json
 import pickle
 import struct
 import sys
 from array import array
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, cast
 
-from findex.index import DocMeta, InvertedIndex, Posting
+from findex.index import DocMeta, Index, Posting
+from findex.timing import timed
 
 StorageFormat = Literal["binary", "pickle"]
 
-BINARY_MAGIC = b"FIDX0001"
+BINARY_MAGIC_V1 = b"FIDX0001"
+BINARY_MAGIC = b"FIDX0002"
 
 
-def _save_pickle(index: InvertedIndex, path: Path) -> None:
+def _save_pickle(index: Index, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fh:
         pickle.dump(index, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def _load_pickle(path: Path) -> InvertedIndex:
+def _load_pickle(path: Path) -> Index:
     # SECURITY WARNING: pickle.load executes arbitrary Python callables embedded
     # via __reduce__ during unpickling (Remote Code Execution vulnerability).
     # Only ever load pickle index files that you generated locally yourself —
     # NEVER unpickle files downloaded from the internet or received over a network.
     with path.open("rb") as fh:
         obj: object = pickle.load(fh)
-    if not isinstance(obj, InvertedIndex):
-        raise TypeError(f"Expected InvertedIndex in {path}, got {type(obj).__name__}")
+    if not isinstance(obj, Index):
+        raise TypeError(f"Expected Index in {path}, got {type(obj).__name__}")
     return obj
 
 
-def _save_binary(index: InvertedIndex, path: Path) -> None:
+def _save_binary(index: Index, path: Path) -> None:
     """Save index as a JSON metadata header followed by contiguous uint32 arrays."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -43,7 +47,7 @@ def _save_binary(index: InvertedIndex, path: Path) -> None:
     tfs: array[int] = array("I")
     positions_flat: array[int] = array("I")
 
-    for term, plist in index.postings.items():
+    for term, plist in index.items():
         terms.append(term)
         counts.append(len(plist))
         for p in plist:
@@ -53,9 +57,10 @@ def _save_binary(index: InvertedIndex, path: Path) -> None:
                 positions_flat.extend(p.positions)
 
     docs_table = [
-        [meta.doc_id, index.doc_lengths[meta.doc_id], meta.title, meta.path]
+        [meta.doc_id, index.doc_length(meta.doc_id), meta.title, meta.path]
         for meta in index.doc_meta.values()
     ]
+    texts_table = [index.doc_text(meta.doc_id) for meta in index.doc_meta.values()]
 
     header_dict: dict[str, object] = {
         "has_positions": index.has_positions,
@@ -64,6 +69,7 @@ def _save_binary(index: InvertedIndex, path: Path) -> None:
         "terms": terms,
         "counts": counts,
         "docs": docs_table,
+        "texts": texts_table if index.doc_texts else [],
     }
     header_bytes = json.dumps(header_dict, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
@@ -84,11 +90,11 @@ def _save_binary(index: InvertedIndex, path: Path) -> None:
             fh.write(positions_flat.tobytes())
 
 
-def _load_binary(path: Path) -> InvertedIndex:
+def _load_binary(path: Path) -> Index:
     """Load index safely from the compact JSON-header + uint32 array format."""
     with path.open("rb") as fh:
         magic = fh.read(len(BINARY_MAGIC))
-        if magic != BINARY_MAGIC:
+        if magic not in {BINARY_MAGIC, BINARY_MAGIC_V1}:
             raise ValueError(f"Invalid binary index header in {path}")
 
         (header_len,) = struct.unpack("<Q", fh.read(8))
@@ -103,6 +109,7 @@ def _load_binary(path: Path) -> InvertedIndex:
         terms = cast("list[str]", header["terms"])
         counts = cast("list[int]", header["counts"])
         docs_table = cast("list[list[object]]", header["docs"])
+        texts_table = cast("list[str]", header.get("texts", []))
 
         doc_ids: array[int] = array("I")
         doc_ids.frombytes(fh.read(total_postings * 4))
@@ -145,32 +152,37 @@ def _load_binary(path: Path) -> InvertedIndex:
 
     doc_lengths: dict[int, int] = {}
     doc_meta: dict[int, DocMeta] = {}
-    for row in docs_table:
+    doc_texts: dict[int, str] = {}
+    for row_idx, row in enumerate(docs_table):
         doc_id = cast("int", row[0])
         doc_len = cast("int", row[1])
         title = cast("str", row[2])
         doc_path = cast("str", row[3])
         doc_lengths[doc_id] = doc_len
         doc_meta[doc_id] = DocMeta(doc_id=doc_id, title=title, path=doc_path)
+        if row_idx < len(texts_table):
+            doc_texts[doc_id] = texts_table[row_idx]
 
-    return InvertedIndex(
+    return Index(
         postings=postings,
         doc_lengths=doc_lengths,
         doc_meta=doc_meta,
         has_positions=has_positions,
+        doc_texts=doc_texts,
     )
 
 
-def save(index: InvertedIndex, path: Path, fmt: StorageFormat = "binary") -> None:
-    """Persist an InvertedIndex to disk in the requested format."""
+def save(index: Index, path: Path, fmt: StorageFormat = "binary") -> None:
+    """Persist an Index to disk in the requested format."""
     if fmt == "binary":
         _save_binary(index, path)
     else:
         _save_pickle(index, path)
 
 
-def load(path: Path, fmt: StorageFormat | None = None) -> InvertedIndex:
-    """Load an InvertedIndex from disk, auto-detecting format if fmt is None."""
+@timed
+def load(path: Path, fmt: StorageFormat | None = None) -> Index:
+    """Load an Index from disk, auto-detecting format if fmt is None."""
     if fmt == "binary":
         return _load_binary(path)
     if fmt == "pickle":
@@ -178,6 +190,16 @@ def load(path: Path, fmt: StorageFormat | None = None) -> InvertedIndex:
 
     with path.open("rb") as fh:
         prefix = fh.read(len(BINARY_MAGIC))
-    if prefix == BINARY_MAGIC:
+    if prefix in {BINARY_MAGIC, BINARY_MAGIC_V1}:
         return _load_binary(path)
     return _load_pickle(path)
+
+
+@contextmanager
+def open_index(path: Path, fmt: StorageFormat | None = None) -> Generator[Index]:
+    """Context manager that loads an Index and guarantees close() on exit."""
+    index = load(path, fmt=fmt)
+    try:
+        yield index
+    finally:
+        index.close()

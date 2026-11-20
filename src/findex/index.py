@@ -1,17 +1,23 @@
-"""Inverted index data models and single-pass streaming builder (Lab 2, M1)."""
+"""Inverted index object model and single-pass streaming builder (Lab 2–3)."""
 
 import argparse
+import functools
 import gc
+import itertools
 import time
 import tracemalloc
 from collections import Counter, defaultdict
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Literal
 
 from findex.corpus import iter_documents
+from findex.timing import timed
 from findex.tokenize import tokenize
+
+_INDEX_TOKEN_SEQ = itertools.count(1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,23 +38,102 @@ class DocMeta:
     path: str
 
 
-@dataclass(slots=True)
-class InvertedIndex:
-    """In-memory inverted index built from a streaming corpus."""
+class Index(Mapping[str, list[Posting]]):
+    """Inverted index implementing the Python Mapping protocol.
 
-    postings: dict[str, list[Posting]]
-    doc_lengths: dict[int, int]
-    doc_meta: dict[int, DocMeta]
-    has_positions: bool = False
+    Supports len(index), `term in index`, index[term], iteration over terms,
+    repr(index), and cached corpus statistics needed for BM25/TF-IDF ranking.
+    """
+
+    def __init__(
+        self,
+        postings: dict[str, list[Posting]],
+        doc_lengths: dict[int, int],
+        doc_meta: dict[int, DocMeta],
+        *,
+        has_positions: bool = False,
+        doc_texts: dict[int, str] | None = None,
+    ) -> None:
+        self._postings = postings
+        self._doc_lengths = doc_lengths
+        self._doc_meta = doc_meta
+        self._doc_texts: dict[int, str] = doc_texts if doc_texts is not None else {}
+        self.has_positions = has_positions
+        self.cache_token: int = next(_INDEX_TOKEN_SEQ)
+        self._closed = False
+
+    @property
+    def postings(self) -> dict[str, list[Posting]]:
+        return self._postings
+
+    @property
+    def doc_lengths(self) -> dict[int, int]:
+        return self._doc_lengths
+
+    @property
+    def doc_meta(self) -> dict[int, DocMeta]:
+        return self._doc_meta
+
+    @property
+    def doc_texts(self) -> dict[int, str]:
+        return self._doc_texts
+
+    @property
+    def num_docs(self) -> int:
+        return len(self._doc_lengths)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @functools.cached_property
+    def avg_doc_length(self) -> float:
+        if not self._doc_lengths:
+            return 0.0
+        return sum(self._doc_lengths.values()) / len(self._doc_lengths)
+
+    def doc_length(self, doc_id: int) -> int:
+        return self._doc_lengths[doc_id]
+
+    def doc_text(self, doc_id: int) -> str:
+        return self._doc_texts.get(doc_id, "")
+
+    def df(self, term: str) -> int:
+        plist = self._postings.get(term)
+        return len(plist) if plist is not None else 0
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __len__(self) -> int:
+        return len(self._postings)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and key in self._postings
+
+    def __getitem__(self, key: str) -> list[Posting]:
+        return self._postings[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._postings)
+
+    def __repr__(self) -> str:
+        return f"Index(terms={len(self):,}, docs={self.num_docs:,})"
 
 
+# Backward-compatible alias for Lab 2 callers
+InvertedIndex = Index
+
+
+@timed
 def build_index(
     root: Path,
     *,
     include_positions: bool = False,
+    store_text: bool = True,
     limit: int | None = None,
-) -> InvertedIndex:
-    """Build an inverted index in a single lazy pass over the corpus.
+) -> Index:
+    """Build an Index in a single lazy pass over the corpus.
 
     Because iter_documents yields strictly increasing doc_ids, every term's
     postings list is naturally sorted by doc_id without a post-sort pass.
@@ -56,6 +141,7 @@ def build_index(
     postings_map: defaultdict[str, list[Posting]] = defaultdict(list)
     doc_lengths: dict[int, int] = {}
     doc_meta: dict[int, DocMeta] = {}
+    doc_texts: dict[int, str] = {}
 
     doc_stream = iter_documents(root)
     if limit is not None:
@@ -83,12 +169,15 @@ def build_index(
             title=doc.title,
             path=str(doc.path),
         )
+        if store_text:
+            doc_texts[doc.doc_id] = doc.text
 
-    return InvertedIndex(
+    return Index(
         postings=dict(postings_map),
         doc_lengths=doc_lengths,
         doc_meta=doc_meta,
         has_positions=include_positions,
+        doc_texts=doc_texts,
     )
 
 
@@ -111,7 +200,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--positions",
         action="store_true",
-        help="Store token positions per posting (enables phrase queries in Lab 3)",
+        help="Store token positions per posting (enables phrase queries)",
+    )
+    parser.add_argument(
+        "--no-text",
+        action="store_true",
+        help="Do not embed raw document text inside the index (smaller file, no snippets)",
     )
     parser.add_argument(
         "--limit",
@@ -125,13 +219,19 @@ def main(argv: list[str] | None = None) -> int:
     out_path: Path = args.out
     fmt: Literal["binary", "pickle"] = args.fmt
     include_positions: bool = args.positions
+    store_text: bool = not args.no_text
     limit: int | None = args.limit
 
     gc.collect()
     tracemalloc.start()
     t0 = time.perf_counter()
 
-    index = build_index(corpus_path, include_positions=include_positions, limit=limit)
+    index = build_index(
+        corpus_path,
+        include_positions=include_positions,
+        store_text=store_text,
+        limit=limit,
+    )
     build_sec = time.perf_counter() - t0
 
     t_save = time.perf_counter()
@@ -144,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     file_mib = out_path.stat().st_size / (1024 * 1024)
     peak_mib = peak_bytes / (1024 * 1024)
 
-    print(f"Indexed {len(index.doc_meta):,} documents ({len(index.postings):,} unique terms)")
+    print(f"Built {index!r}")
     print(f"Positions:   {'yes' if index.has_positions else 'no'}")
     print(f"Format:      {fmt} -> {out_path} ({file_mib:.2f} MiB)")
     print(f"Build time:  {build_sec:.3f} s | Save time: {save_sec:.3f} s")

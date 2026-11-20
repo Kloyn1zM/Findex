@@ -122,3 +122,66 @@ uv run python -m findex.index data/ --out data/index.bin --positions
 uv run python -m findex.search data/index.bin "python programming"
 uv run python -m findex.search data/index.bin "ukraine NOT russia" --engine set --limit 5
 ~~~
+
+---
+
+## Lab 03 — Ranking and the Object Model: Dunders, Protocols, Query Language
+
+### What was built
+- **`src/findex/index.py`**: refactored the inverted index into `Index(collections.abc.Mapping[str, list[Posting]])` implementing `__len__`, `__contains__`, `__getitem__`, `__iter__`, `__repr__`, `num_docs`, `df()`, `doc_length()`, and `functools.cached_property` for `avg_doc_length` (756.1 tokens on the full corpus).
+- **`src/findex/store.py`**: added `@contextmanager def open_index(path)` guaranteeing `index.close()` on normal exit and exceptions, and upgraded the binary format (`FIDX0002`) to store raw document texts alongside postings for snippet generation.
+- **`src/findex/scoring.py`**: defined a structural `Scorer` `Protocol` with two swappable implementations (`TfIdf` and `BM25(k1=1.5, b=0.75)`), `@total_ordering` `SearchResult`, and `make_snippet()` extracting a $\pm 80$-character highlighted window.
+- **`src/findex/query.py`**: recursive-descent query parser supporting implicit/explicit `AND`, `OR`, `NOT`, parentheses, and `"quoted phrases"` (via two-pointer adjacency merge over positional postings), producing operator-overloaded AST nodes (`Term`, `Phrase`, `And`, `Or`, `Not` with `&`, `|`, `~`).
+- **`src/findex/timing.py` & `src/findex/search.py`**: `@timed` decorator (with `functools.wraps`) on `build_index`, `load`, and `search`; `@functools.lru_cache(maxsize=256)` on the ranked ID lookup path; `heapq.nlargest` for $O(n \log k)$ top-$k$ selection.
+- **`tests/test_ranking_and_query.py`**: 9 pytest tests covering the `Mapping` protocol, `open_index` exception safety, parser AST tree equality, phrase queries, all three ranking sanity checks, `@timed`/`lru_cache`, and snippet highlighting.
+
+### M2: Ranking sanity checks (5,000-document corpus, `BM25(k1=1.5, b=0.75)`)
+
+1. **Rare term outranks common term** (`the OR gallium`, where `df("gallium")=2` vs `df("the")=4,981`):
+   - `#1 [4996] Gallium` (`score=17.6699`, `has_gallium=True`)
+   - `#2 [4994] Arsenic` (`score=6.4172`, `has_gallium=True`)
+   - `#3 [4145] Solstice` (`score=0.0096`, `has_gallium=False`)
+2. **BM25 term-frequency saturation** (`term="computer"`, `doc_id=6`, `len=855`, `df=437`):
+   - `tf=1` → `2.3009` | `tf=5` → `4.5815` | `tf=19` → `5.6049` | `tf=20` → `5.6273`
+   - The 20th occurrence adds only **+0.02245** (**0.98%** of the first occurrence).
+3. **Document-length normalization** (`term="astronomy"`, `tf=1`):
+   - Short doc `[974] List of satellites of the Milky Way` (`len=121`) → `BM25=6.9699`
+   - Long doc `[463] Albert Einstein` (`len=4,537`) → `BM25=1.3339`
+
+### M4: `@timed` and `lru_cache` log evidence
+
+~~~text
+DEBUG findex.timing: search took 4.39 ms
+  After 1st call: SearchCacheInfo(hits=0, misses=1, maxsize=256, currsize=1)
+DEBUG findex.search: search cache HIT for query='solar system planets' (CacheInfo(hits=1, misses=1, maxsize=256, currsize=1))
+DEBUG findex.timing: search took 4.23 ms
+  After 2nd call: SearchCacheInfo(hits=1, misses=1, maxsize=256, currsize=1)
+~~~
+
+Notice that the cache hit still reports ~4.23 ms end-to-end because `_cached_ranked_ids` caches the `(doc_id, score)` ranking step, while `search()` still generates highlighted snippets over the top-5 raw article texts on every call.
+
+### M4: Precision@5 evaluation (10 hand-labeled queries, TF-IDF vs. BM25)
+
+| # | Query | TF-IDF P@5 | BM25 P@5 | Notes on top-5 differences |
+|---|---|---|---|---|
+| 1 | `python programming` | 0.60 (3/5) | 0.60 (3/5) | Identical top-5 (`Programming language`, `C`, `Variable` relevant) |
+| 2 | `solar system planets` | 1.00 (5/5) | 0.80 (4/5) | TF-IDF returns 5 core articles; BM25 pulls `Natural satellite` into #4 |
+| 3 | `world war europe` | 0.20 (1/5) | 0.60 (3/5) | BM25 surfaces `World War`, `Europe`, `Kingdom of Yugoslavia`; TF-IDF favors long country pages |
+| 4 | `dna genetics cell` | 0.80 (4/5) | 0.80 (4/5) | Same 5 documents reordered (`Genetics`, `Gene`, `Protein`, `Evolution` relevant) |
+| 5 | `roman empire caesar` | 0.60 (3/5) | 0.40 (2/5) | BM25 length norm over-boosts tiny year stubs (`2`, `5`, `7`) over `Rome` |
+| 6 | `linux operating system` | 1.00 (5/5) | 0.80 (4/5) | TF-IDF returns 5/5 Linux/OS pages; BM25 puts broad `Personal computer` at #5 |
+| 7 | `albert einstein relativity` | 0.80 (4/5) | 0.80 (4/5) | Both rank `Einstein`, `Special/General relativity`, `Gravity` in top-5 |
+| 8 | `periodic table chemical elements` | 0.60 (3/5) | 0.80 (4/5) | BM25 elevates element groups (`Halogen`, `Transition metal`) over `Atom`/`Hydrogen` |
+| 9 | `ancient egypt pharaoh` | 0.60 (3/5) | 0.60 (3/5) | Same 5 documents (`Pharaoh`, `Ancient Egypt`, `Pyramid` relevant; `Moses`/`Aaron` noisy) |
+| 10 | `jazz music instruments` | 0.40 (2/5) | 0.80 (4/5) | BM25 ranks `Jazz` #1 and surfaces `Saxophone` & `Tuba`; TF-IDF ranks `Music`/`Classical`/`Violin` |
+| **Mean** | **10 queries** | **0.66** | **0.70** | **BM25 +0.04 macro P@5** |
+
+BM25 outperforms log-TF-IDF overall (**0.70 vs. 0.66**) by preventing very long encyclopedic articles (like generic country pages in Q3 or `Music`/`Orchestra` in Q10) from dominating solely through raw term repetition. At the same time, Q5 (`roman empire caesar`) exposes a real-world BM25 failure mode: with $b=0.75$, very short Wikipedia year-stub articles (`2`, `5`, `7`) receive a strong length bonus and outrank the much longer `Rome` article.
+
+### Running Lab 03
+
+~~~bash
+uv run python -m findex.index data/ --out data/index.bin --positions
+uv run python -m findex.search data/index.bin "\"programming language\" OR python" -k 5 -v
+uv run python -m findex.search data/index.bin "jazz music instruments" --scorer tfidf -k 5
+~~~

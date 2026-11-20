@@ -1,96 +1,41 @@
-"""Boolean search using two-pointer sorted merge or Python sets (Lab 2, M2)."""
+"""Boolean and ranked search with LRU query caching and snippets (Lab 2–3)."""
 
 import argparse
+import functools
 import gc
+import heapq
+import logging
+import sys
 import time
 import tracemalloc
-from collections.abc import Sequence
+import weakref
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from findex.index import InvertedIndex
-from findex.store import load
+from findex.index import Index
+from findex.query import merge_and, merge_and_not, merge_or, parse_query
+from findex.scoring import BM25, Scorer, SearchResult, TfIdf, make_snippet
+from findex.store import open_index
+from findex.timing import timed
 from findex.tokenize import tokenize
+
+log = logging.getLogger(__name__)
 
 SearchEngine = Literal["merge", "set"]
 
-
-def merge_and(a: Sequence[int], b: Sequence[int]) -> list[int]:
-    """Two-pointer intersection of two sorted doc_id sequences in O(len(a) + len(b))."""
-    result: list[int] = []
-    i = 0
-    j = 0
-    len_a = len(a)
-    len_b = len(b)
-    while i < len_a and j < len_b:
-        da = a[i]
-        db = b[j]
-        if da == db:
-            result.append(da)
-            i += 1
-            j += 1
-        elif da < db:
-            i += 1
-        else:
-            j += 1
-    return result
+_INDEX_REGISTRY: dict[int, weakref.ref[Index]] = {}
 
 
-def merge_or(a: Sequence[int], b: Sequence[int]) -> list[int]:
-    """Two-pointer union of two sorted doc_id sequences in O(len(a) + len(b))."""
-    result: list[int] = []
-    i = 0
-    j = 0
-    len_a = len(a)
-    len_b = len(b)
-    while i < len_a and j < len_b:
-        da = a[i]
-        db = b[j]
-        if da == db:
-            result.append(da)
-            i += 1
-            j += 1
-        elif da < db:
-            result.append(da)
-            i += 1
-        else:
-            result.append(db)
-            j += 1
-    if i < len_a:
-        result.extend(a[i:])
-    if j < len_b:
-        result.extend(b[j:])
-    return result
+def _score_key(item: tuple[int, float]) -> float:
+    return item[1]
 
 
-def merge_and_not(a: Sequence[int], b: Sequence[int]) -> list[int]:
-    """Two-pointer difference (elements in sorted a that are absent from sorted b)."""
-    result: list[int] = []
-    i = 0
-    j = 0
-    len_a = len(a)
-    len_b = len(b)
-    while i < len_a and j < len_b:
-        da = a[i]
-        db = b[j]
-        if da == db:
-            i += 1
-            j += 1
-        elif da < db:
-            result.append(da)
-            i += 1
-        else:
-            j += 1
-    if i < len_a:
-        result.extend(a[i:])
-    return result
-
-
-def _term_doc_ids(index: InvertedIndex, term: str) -> list[int]:
-    plist = index.postings.get(term)
-    if not plist:
+def _term_doc_ids(index: Index, term: str) -> list[int]:
+    if term not in index:
         return []
-    return [p.doc_id for p in plist]
+    return [p.doc_id for p in index[term]]
 
 
 def _combine_and(a: list[int], b: list[int], engine: SearchEngine) -> list[int]:
@@ -112,16 +57,12 @@ def _combine_and_not(a: list[int], b: list[int], engine: SearchEngine) -> list[i
 
 
 def boolean_search(
-    index: InvertedIndex,
+    index: Index,
     query: str,
     *,
     engine: SearchEngine = "merge",
 ) -> list[int]:
-    """Evaluate a left-to-right Boolean query with implicit AND, OR, and NOT.
-
-    Operators must be uppercase (`AND`, `OR`, `NOT`). Terms are normalized
-    through the same streaming tokenizer used during indexing.
-    """
+    """Evaluate a left-to-right Boolean query with implicit AND, OR, and NOT."""
     raw_parts = query.split()
     if not raw_parts:
         return []
@@ -171,54 +112,216 @@ def boolean_search(
     return result if result is not None else []
 
 
+def _compute_ranked_ids(
+    index: Index,
+    query: str,
+    scorer: Scorer,
+    k: int,
+) -> tuple[tuple[int, float], ...]:
+    """Parse query, evaluate matched documents, score them, and return top-k (doc_id, score)."""
+    if k <= 0 or not query.strip():
+        return ()
+
+    tree = parse_query(query)
+    matched_ids = tree.evaluate(index)
+    if not matched_ids:
+        return ()
+
+    pos_terms = tree.positive_terms()
+    if not pos_terms:
+        return tuple((doc_id, 0.0) for doc_id in matched_ids[:k])
+
+    allowed = set(matched_ids)
+    scores: defaultdict[int, float] = defaultdict(float)
+
+    for term in pos_terms:
+        if term not in index:
+            continue
+        for posting in index[term]:
+            if posting.doc_id in allowed:
+                scores[posting.doc_id] += scorer.score(term, posting, index)
+
+    top_pairs = heapq.nlargest(k, scores.items(), key=_score_key)
+    return tuple(top_pairs)
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_ranked_ids(
+    cache_token: int,
+    query: str,
+    scorer: Scorer,
+    k: int,
+) -> tuple[tuple[int, float], ...]:
+    ref = _INDEX_REGISTRY.get(cache_token)
+    index = ref() if ref is not None else None
+    if index is None:
+        return ()
+    return _compute_ranked_ids(index, query, scorer, k)
+
+
+@dataclass(frozen=True, slots=True)
+class SearchCacheInfo:
+    """Public snapshot of LRU cache statistics for ranked search."""
+
+    hits: int
+    misses: int
+    maxsize: int | None
+    currsize: int
+
+
+def search_cache_info() -> SearchCacheInfo:
+    """Return LRU cache statistics for the ranked search path."""
+    info = _cached_ranked_ids.cache_info()
+    return SearchCacheInfo(
+        hits=info.hits,
+        misses=info.misses,
+        maxsize=info.maxsize,
+        currsize=info.currsize,
+    )
+
+
+def clear_search_cache() -> None:
+    """Clear cached ranked query results."""
+    _cached_ranked_ids.cache_clear()
+
+
+@timed
+def search(
+    index: Index,
+    query: str,
+    *,
+    scorer: Scorer | None = None,
+    k: int = 10,
+    highlight_start: str = "**",
+    highlight_end: str = "**",
+) -> list[SearchResult]:
+    """Run a parsed, ranked search returning top-k SearchResult objects with snippets."""
+    active_scorer: Scorer = scorer if scorer is not None else BM25()
+    if k <= 0 or not query.strip():
+        return []
+
+    try:
+        hash(active_scorer)
+    except TypeError:
+        is_hashable = False
+    else:
+        is_hashable = True
+
+    if is_hashable:
+        _INDEX_REGISTRY[index.cache_token] = weakref.ref(index)
+        before_hits = _cached_ranked_ids.cache_info().hits
+        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, k)
+        after_hits = _cached_ranked_ids.cache_info().hits
+        if after_hits > before_hits:
+            log.debug("search cache HIT for query=%r (%s)", query, _cached_ranked_ids.cache_info())
+    else:
+        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, k)
+
+    pos_terms = parse_query(query).positive_terms()
+    results: list[SearchResult] = []
+    for doc_id, score in ranked_pairs:
+        meta = index.doc_meta[doc_id]
+        snippet = make_snippet(
+            index.doc_text(doc_id),
+            pos_terms,
+            highlight_start=highlight_start,
+            highlight_end=highlight_end,
+        )
+        results.append(
+            SearchResult(
+                doc_id=doc_id,
+                score=score,
+                title=meta.title,
+                snippet=snippet,
+            )
+        )
+    return results
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m findex.search",
-        description="Run Boolean queries against a persisted inverted index.",
+        description="Run ranked or Boolean queries against a persisted index.",
     )
     parser.add_argument("index_path", type=Path, help="Path to saved index file")
-    parser.add_argument("query", type=str, help="Boolean query (implicit AND, OR, NOT)")
+    parser.add_argument("query", type=str, help="Query string (supports AND, OR, NOT, (), quotes)")
+    parser.add_argument(
+        "--mode",
+        choices=("ranked", "boolean"),
+        default="ranked",
+        help="Search mode (default: ranked)",
+    )
+    parser.add_argument(
+        "--scorer",
+        choices=("bm25", "tfidf"),
+        default="bm25",
+        help="Ranking algorithm in ranked mode (default: bm25)",
+    )
     parser.add_argument(
         "--engine",
         choices=("merge", "set"),
         default="merge",
-        help="Postings combination backend (default: merge)",
+        help="Postings backend in boolean mode (default: merge)",
     )
     parser.add_argument(
         "--limit",
+        "-k",
         type=int,
         default=10,
-        help="Maximum number of matching titles to display (default: 10)",
+        help="Maximum number of results to display (default: 10)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable DEBUG logging (shows @timed durations and cache hits)",
     )
     args = parser.parse_args(argv)
 
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(levelname)s %(name)s: %(message)s",
+            stream=sys.stderr,
+        )
+
     index_path: Path = args.index_path
     query: str = args.query
+    mode: Literal["ranked", "boolean"] = args.mode
+    scorer_name: Literal["bm25", "tfidf"] = args.scorer
     engine: SearchEngine = args.engine
     limit: int = args.limit
 
     gc.collect()
     tracemalloc.start()
 
-    t_load = time.perf_counter()
-    index = load(index_path)
-    load_ms = (time.perf_counter() - t_load) * 1000
+    with open_index(index_path) as index:
+        t_search = time.perf_counter()
+        if mode == "boolean":
+            doc_ids = boolean_search(index, query, engine=engine)
+            search_ms = (time.perf_counter() - t_search) * 1000.0
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
 
-    t_search = time.perf_counter()
-    doc_ids = boolean_search(index, query, engine=engine)
-    search_ms = (time.perf_counter() - t_search) * 1000
+            print(f"Query:  {query!r} (mode=boolean, engine={engine})")
+            print(f"Hits:   {len(doc_ids):,} documents | search={search_ms:.3f} ms")
+            print(f"Peak:   {peak_bytes / (1024 * 1024):.2f} MiB\n")
+            for rank, doc_id in enumerate(doc_ids[:limit], start=1):
+                print(f"  {rank:>2}. [{doc_id}] {index.doc_meta[doc_id].title}")
+        else:
+            scorer: Scorer = BM25() if scorer_name == "bm25" else TfIdf()
+            results = search(index, query, scorer=scorer, k=limit)
+            search_ms = (time.perf_counter() - t_search) * 1000.0
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
 
-    _, peak_bytes = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-
-    print(f"Query:  {query!r} (engine={engine})")
-    print(f"Hits:   {len(doc_ids):,} documents")
-    print(f"Timing: load={load_ms:.1f} ms | search={search_ms:.3f} ms")
-    print(f"Peak:   {peak_bytes / (1024 * 1024):.2f} MiB\n")
-
-    for rank, doc_id in enumerate(doc_ids[:limit], start=1):
-        meta = index.doc_meta[doc_id]
-        print(f"  {rank:>2}. [{doc_id}] {meta.title}")
+            print(f"Query:  {query!r} (mode=ranked, scorer={scorer_name})")
+            print(f"Top:    {len(results)} results | search={search_ms:.3f} ms")
+            print(f"Peak:   {peak_bytes / (1024 * 1024):.2f} MiB\n")
+            for rank, res in enumerate(results, start=1):
+                print(f"  {rank:>2}. {res}")
+                if res.snippet:
+                    print(f"      {res.snippet}")
 
     return 0
 
