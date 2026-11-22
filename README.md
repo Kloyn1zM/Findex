@@ -234,3 +234,73 @@ findex search data/index.bin "solar system planets" --k 5
 findex search data/index.bin "solar system planets" --k 5 --json
 findex -vv search data/index.bin "solar system planets" --k 3
 ~~~
+
+---
+
+## Lab 05 — Concurrency and the GIL: Parallel Indexing & Free-Threaded Python
+
+### What was built
+- **`src/findex/parallel.py`**: split index construction into a map-reduce pipeline — top-level, picklable `build_partial(doc_paths, ...)` workers that stream their own shard files and pack postings into compact `array('I')` buffers (`PartialIndex`), plus `merge(partials)` that reassembles globally unique `doc_id`s and sorted postings lists.
+- **`src/findex/index.py` & `src/findex/cli.py`**: unified `--executor {serial,threads,processes}` (defaulting to `processes`) and `--workers N` options on `findex index`, spawn-safe on Windows, propagating worker exceptions cleanly without hangs.
+- **`tests/test_parallel.py`**: 7 pytest tests proving **byte-identical** serialized binary indexes across `serial`, `threads`, `processes`, and the Lab 4 baseline (with and without positions), out-of-order/interleaved `merge()` correctness, and worker exception propagation.
+
+### Machine specs & benchmark methodology
+- **OS**: Windows 10 (`10.0.19045-SP0`)
+- **CPU**: AMD64 Family 23 Model 24 Stepping 1 (`os.cpu_count() = 8` logical CPUs / 4 physical cores with SMT)
+- **Runtimes**: CPython `3.13.12` (GIL enabled: `True`) and free-threaded CPython `3.13.18` (`python3.13t`, `sys._is_gil_enabled() == False`)
+- **Methodology**: full 5,000-document Simple English Wikipedia corpus (40 sharded `.jsonl` files, 23.47 MiB), 1-shard warmup followed by **3 timed runs** per configuration in an isolated child process; reporting median wall-clock time (`time.perf_counter()`), total CPU time (`time.process_time()` parent + workers), peak working set (`Peak RSS`), and sequential `merge()` time.
+
+### M3 & M4: Indexing benchmark (5,000 docs, no positions)
+
+| Executor | Workers | Wall (s, median) | CPU (s) | Peak RSS (MiB) | Merge (s) | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `serial` | 1 | 9.550 | 9.547 | 231.0 | 3.447 | 1.00× |
+| `threads` (GIL) | 2 | 10.325 | 10.344 | 234.5 | 3.588 | 0.92× |
+| `threads` (GIL) | 4 | 11.815 | 11.859 | 237.4 | 3.745 | 0.81× |
+| `threads` (GIL) | 8 | 11.946 | 12.062 | 241.5 | 3.918 | 0.80× |
+| `processes` | 2 | 7.023 | 9.797 | 232.6 | 3.324 | 1.36× |
+| `processes` | 4 | 6.530 | 11.484 | 235.7 | 3.494 | 1.46× |
+| `processes` | 8 | 6.443 | 13.828 | 240.8 | 3.711 | 1.48× |
+| `serial` (3.13t no-GIL) | 1 | 8.781 | 8.672 | 264.0 | 2.993 | 1.09× |
+| `threads` (3.13t no-GIL) | 2 | 6.559 | 9.594 | 366.6 | 3.284 | 1.46× |
+| `threads` (3.13t no-GIL) | 4 | 6.633 | 11.906 | 389.8 | 3.525 | 1.44× |
+| `threads` (3.13t no-GIL) | 8 | 6.713 | 14.766 | 422.8 | 3.862 | 1.42× |
+
+![Parallel Indexing Speedup](docs/lab05_speedup.png)
+
+### I/O-bound counter-benchmark (`ThreadPoolExecutor`, 50 × 40 ms waits)
+
+| Workers | Wall (s) | Speedup |
+|---:|---:|---:|
+| 1 (serial) | 2.341 | 1.00× |
+| 4 threads | 0.584 | 4.01× |
+| 8 threads | 0.341 | 6.87× |
+| 16 threads | 0.200 | 11.69× |
+
+### Race condition exposed by free-threaded Python (`3.13t`)
+
+Four threads each executing `shared += 1` 200,000 times (expected total: **800,000**):
+
+| Build | `sys._is_gil_enabled()` | Unsynchronized `shared += 1` | Lost updates | Protected with `threading.Lock` |
+|---|---|---|---|---|
+| CPython 3.13.12 (GIL) | `True` | 800,000 | 0 | 800,000 |
+| CPython 3.13.18 (`3.13t`) | `False` | **435,356** | **364,644 (45.6%)** | **800,000** |
+
+### Why the numbers look this way
+
+1. **Why threads failed under the GIL (0.92× → 0.80×) while scaling for I/O (11.69×):**
+   Indexing is overwhelmingly CPU-bound (JSON parsing, Unicode NFC normalization, regex tokenization, and dictionary counting in Python bytecode). Because CPython's Global Interpreter Lock allows only one thread to execute bytecode at a time, adding 2, 4, or 8 threads produces zero parallelism and adds ~25% lock-contention and context-switch overhead (`9.550 s` → `11.946 s`). By contrast, in the I/O-bound counter-benchmark, blocking waits release the GIL, allowing 16 threads to overlap waits for an **11.69×** speedup.
+2. **Why processes scaled — and the real cost of pickling & `spawn`:**
+   Each worker in `ProcessPoolExecutor` runs an independent Python interpreter with its own GIL, unlocking true multi-core execution (`6.443 s` wall time at 8 workers, **1.48×** faster than serial). However, escaping the GIL is not free: total CPU time climbs from `9.55 s` to `13.83 s` due to Windows `spawn` startup (re-importing `findex` per worker) and IPC serialization. Crucially, our first prototype returned `dict[str, list[Posting]]` (1,674,803 frozen slotted objects) across pipes and ran **slower than serial** (`14.961 s`, `0.63×`) because unpickling millions of small Python objects dominated wall time. Packing worker results into contiguous `array('I')` buffers in `PartialIndex` eliminated that pickling bottleneck and cut 8-worker process time by **2.32×** (`14.961 s` → `6.443 s`).
+3. **Where Amdahl's law caps the speedup:**
+   With `PartialIndex` packed into `array('I')`, the sequential `merge()` phase in the parent process reconstructs `Posting` objects and merges 129,327 term lists, taking **3.447 s out of 9.550 s** (**36.1%** of total serial work). By Amdahl's law, $S_{\max} = \frac{1}{s + (1 - s)/N}$: even with infinite cores ($N \to \infty$), speedup cannot exceed $1 / 0.361 = \mathbf{2.77\times}$, and with 4 physical cores it caps at **1.92×** before counting Windows `spawn` and IPC overhead. This explains why scaling flattens between 4 workers (`6.530 s`, `1.46×`) and 8 workers (`6.443 s`, `1.48×`) on a 4-core/8-thread CPU.
+4. **What changed on free-threaded Python `3.13t` — and the race condition lesson:**
+   With the GIL disabled (`sys._is_gil_enabled() == False`), the exact same `ThreadPoolExecutor` code jumped from `0.92×` (GIL) to **1.46×** (`6.559 s`) at 2 workers — matching 4-process performance without `spawn` or pickling, at the cost of higher shared-heap RSS (`366–423 MiB` vs `233–241 MiB` parent RSS) and allocator contention past 4 threads. More importantly, removing the GIL immediately exposed the classic `shared += 1` read-modify-write race: under the GIL the bug stayed hidden (`0` lost updates), whereas on `3.13t` **364,644 updates (45.6%) vanished**. In `findex`, `build_partial()` eliminates shared mutable state entirely (each worker builds an isolated `PartialIndex` merged sequentially after completion), making the indexer inherently race-free on both standard and free-threaded CPython.
+
+### Running Lab 05
+
+~~~bash
+findex index data/ --out data/index.bin --executor processes --workers 4
+findex index data/ --out data/index.bin --executor threads --workers 4
+findex index data/ --out data/index.bin --executor serial
+~~~

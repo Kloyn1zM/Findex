@@ -184,9 +184,25 @@ def build_index(
     include_positions: bool = False,
     store_text: bool = True,
     limit: int | None = None,
+    executor: Literal["serial", "threads", "processes"] = "serial",
+    workers: int | None = None,
     on_doc: Callable[[int], None] | None = None,
+    on_chunk: Callable[[int, int], None] | None = None,
 ) -> Index:
-    """Build an Index in a single lazy pass over a corpus path."""
+    """Build an Index from a corpus path using serial, threaded, or process execution."""
+    if limit is None and on_doc is None:
+        from findex.parallel import build_index_parallel
+
+        index, _ = build_index_parallel(
+            root,
+            executor=executor,
+            workers=workers,
+            include_positions=include_positions,
+            store_text=store_text,
+            on_chunk=on_chunk,
+        )
+        return index
+
     doc_stream: Iterable[Document] = iter_documents(root)
     if limit is not None:
         doc_stream = islice(doc_stream, limit)

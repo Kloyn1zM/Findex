@@ -1,4 +1,4 @@
-"""Installable CLI for findex built with Typer, Rich, and standard logging (Lab 4)."""
+"""Installable CLI for findex built with Typer, Rich, and standard logging (Lab 4–5)."""
 
 import heapq
 import json
@@ -16,6 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from findex.index import build_index
+from findex.parallel import ExecutorKind
 from findex.query import QuerySyntaxError
 from findex.scoring import BM25, Scorer, TfIdf
 from findex.search import search as run_search
@@ -44,6 +45,12 @@ class ScorerChoice(StrEnum):
 class FormatChoice(StrEnum):
     binary = "binary"
     pickle = "pickle"
+
+
+class ExecutorChoice(StrEnum):
+    serial = "serial"
+    threads = "threads"
+    processes = "processes"
 
 
 def _configure_logging(verbosity: int) -> None:
@@ -113,6 +120,22 @@ def index_cmd(
         int | None,
         typer.Option("--limit", min=1, help="Index only the first N documents."),
     ] = None,
+    executor: Annotated[
+        ExecutorChoice,
+        typer.Option(
+            "--executor",
+            help="Indexing execution backend (default: processes).",
+        ),
+    ] = ExecutorChoice.processes,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-w",
+            min=1,
+            help="Number of worker threads/processes (default: CPU count).",
+        ),
+    ] = None,
     fmt: Annotated[
         FormatChoice,
         typer.Option("--format", help="Index serialization format."),
@@ -129,29 +152,69 @@ def index_cmd(
 
     t0 = time.perf_counter()
     storage_fmt: StorageFormat = "binary" if fmt is FormatChoice.binary else "pickle"
-    log.info("Starting index build from %s (positions=%s, limit=%s)", corpus, positions, limit)
+    exec_kind: ExecutorKind = (
+        "serial"
+        if executor is ExecutorChoice.serial
+        else ("threads" if executor is ExecutorChoice.threads else "processes")
+    )
+    if limit is not None and exec_kind != "serial":
+        log.info("--limit is set; falling back to serial executor for exact prefix slicing")
+        exec_kind = "serial"
+
+    log.info(
+        "Starting index build from %s (executor=%s, workers=%s, positions=%s, limit=%s)",
+        corpus,
+        exec_kind,
+        workers,
+        positions,
+        limit,
+    )
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            TextColumn("{task.completed:,} docs"),
-            TimeElapsedColumn(),
-            console=stderr_console,
-            transient=True,
-        ) as progress:
-            task_id = progress.add_task("Indexing corpus...", total=limit)
+        if exec_kind == "serial" and limit is not None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TextColumn("{task.completed:,} docs"),
+                TimeElapsedColumn(),
+                console=stderr_console,
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task("Indexing corpus...", total=limit)
 
-            def _on_doc(count: int) -> None:
-                progress.update(task_id, completed=count)
+                def _on_doc(count: int) -> None:
+                    progress.update(task_id, completed=count)
 
-            built = build_index(
-                corpus,
-                include_positions=positions,
-                store_text=not no_text,
-                limit=limit,
-                on_doc=_on_doc,
-            )
+                built = build_index(
+                    corpus,
+                    include_positions=positions,
+                    store_text=not no_text,
+                    limit=limit,
+                    executor="serial",
+                    on_doc=_on_doc,
+                )
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                TextColumn("{task.completed}/{task.total} chunks"),
+                TimeElapsedColumn(),
+                console=stderr_console,
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task(f"Indexing ({exec_kind})...", total=None)
+
+                def _on_chunk(done: int, total: int) -> None:
+                    progress.update(task_id, completed=done, total=total)
+
+                built = build_index(
+                    corpus,
+                    include_positions=positions,
+                    store_text=not no_text,
+                    executor=exec_kind,
+                    workers=workers,
+                    on_chunk=_on_chunk,
+                )
 
         save(built, out, fmt=storage_fmt)
     except (OSError, ValueError) as exc:
@@ -164,7 +227,7 @@ def index_cmd(
 
     stdout_console.print(
         f"Indexed [bold]{built.num_docs:,}[/bold] docs "
-        f"([bold]{len(built):,}[/bold] terms) -> {out} "
+        f"([bold]{len(built):,}[/bold] terms, executor={exec_kind}) -> {out} "
         f"({size_mib:.2f} MiB, {elapsed:.2f} s)"
     )
 
@@ -209,7 +272,11 @@ def search_cmd(
         raise typer.Exit(code=1) from None
 
     log.info(
-        "Query %r (%s) returned %d hits in %.2f ms", query, scorer.value, len(results), elapsed_ms
+        "Query %r (%s) returned %d hits in %.2f ms",
+        query,
+        scorer.value,
+        len(results),
+        elapsed_ms,
     )
 
     if json_output:
