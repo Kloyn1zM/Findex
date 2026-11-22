@@ -1,5 +1,7 @@
 # findex — Full-Text & Semantic Search Engine
 
+[![CI](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml/badge.svg)](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml)
+
 A full-text search engine built incrementally in Python (3.13+, `uv`, `ruff`, `pyright`, `pytest`) from a constant-memory streaming corpus pipeline to a parallel inverted index, ranked query engine, installable CLI, async web crawler, and FastAPI web service.
 
 ## Corpus
@@ -184,4 +186,51 @@ BM25 outperforms log-TF-IDF overall (**0.70 vs. 0.66**) by preventing very long 
 uv run python -m findex.index data/ --out data/index.bin --positions
 uv run python -m findex.search data/index.bin "\"programming language\" OR python" -k 5 -v
 uv run python -m findex.search data/index.bin "jazz music instruments" --scorer tfidf -k 5
+~~~
+
+---
+
+## Lab 04 — Make It a Real Tool: Typing, Testing, Packaging, and CLI
+
+### What was built
+- **Strict static typing (`pyright` strict, 0 errors)**: annotated all public APIs across `src/findex/` using Python 3.12+ generics (`Iterator`, `Iterable`, `X | None`, PEP 695 `type DocId = int`), structural `Scorer(Protocol)`, and `Literal`/`StrEnum` CLI parameters. Every `# type: ignore` is justified inline.
+- **Test suite (`pytest` + `Hypothesis`)**: expanded to **40 tests** including a session-scoped fixture corpus in `tests/conftest.py`, parametrized Unicode tokenizer cases, **4 Hypothesis property-based tests** (`tests/test_properties.py` checking tokenizer idempotence/non-emptiness, merge-vs-set oracle equivalence, sorted postings invariant, and binary save/load round-trip), `@pytest.mark.slow`, and CLI integration tests via `typer.testing.CliRunner`.
+- **Installable CLI (`src/findex/cli.py`)**: packaged with PEP 621 `pyproject.toml`, `uv.lock`, and `[project.scripts] findex = "findex.cli:app"`. Provides `findex index`, `findex search`, and `findex stats` with `rich` tables/progress bars, `--json` JSON-lines output to `stdout`, `-v`/`-vv` diagnostic logging to `stderr`, and clean exit code `1` (no tracebacks) on expected errors.
+- **CI & Release**: added `.github/workflows/ci.yml` running `uv sync --locked`, `ruff check`, `ruff format --check`, `pyright`, and `pytest --cov=findex` on every push/PR; published wheel `findex-0.4.0-py3-none-any.whl` to GitHub Release `v0.4.0`.
+
+### Test coverage (`pytest --cov=findex`)
+
+| Module | Stmts | Miss | Coverage |
+|---|---|---|---|
+| `src/findex/__init__.py` | 1 | 0 | 100% |
+| `src/findex/timing.py` | 14 | 0 | 100% |
+| `src/findex/tokenize.py` | 25 | 1 | 96% |
+| `src/findex/cli.py` | 154 | 8 | 95% |
+| `src/findex/query.py` | 286 | 19 | 93% |
+| `src/findex/store.py` | 133 | 10 | 92% |
+| `src/findex/scoring.py` | 81 | 11 | 86% |
+| `src/findex/corpus.py` | 75 | 18 | 76% |
+| `src/findex/index.py` | 145 | 36 | 75% |
+| `src/findex/search.py` | 189 | 59 | 69% |
+| `src/findex/stats.py` | 90 | 35 | 61% |
+| **TOTAL** | **1,193** | **197** | **83%** |
+
+**What is not covered and why:** core library and CLI modules sit at **86–100%** coverage (`cli.py` 95%, `tokenize.py` 96%, `query.py` 93%, `store.py` 92%). Most uncovered lines are the legacy `python -m` `argparse` entry points retained from Labs 1–3 (`index.py`, `search.py`, `stats.py`), big-endian `byteswap()` guards on x86-64 hardware (`store.py`), and defensive `OSError` handlers (`corpus.py`).
+
+### Installing and running `findex` (`v0.4.0`)
+
+~~~bash
+# Install directly from the v0.4.0 GitHub Release wheel
+uv tool install https://github.com/Kloyn1zM/Findex/releases/download/v0.4.0/findex-0.4.0-py3-none-any.whl
+
+# Or build and install locally
+uv build
+uv tool install --force .
+
+# CLI usage
+findex index data/ --out data/index.bin --positions
+findex stats data/index.bin --top 10
+findex search data/index.bin "solar system planets" --k 5
+findex search data/index.bin "solar system planets" --k 5 --json
+findex -vv search data/index.bin "solar system planets" --k 3
 ~~~

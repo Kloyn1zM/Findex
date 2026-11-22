@@ -1,4 +1,4 @@
-"""Inverted index object model and single-pass streaming builder (Lab 2–3)."""
+"""Inverted index object model and single-pass streaming builder (Lab 2–4)."""
 
 import argparse
 import functools
@@ -7,15 +7,17 @@ import itertools
 import time
 import tracemalloc
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from typing import Literal
 
-from findex.corpus import iter_documents
+from findex.corpus import Document, iter_documents
 from findex.timing import timed
 from findex.tokenize import tokenize
+
+type DocId = int
 
 _INDEX_TOKEN_SEQ = itertools.count(1)
 
@@ -24,7 +26,7 @@ _INDEX_TOKEN_SEQ = itertools.count(1)
 class Posting:
     """Single occurrence record of a term inside a document."""
 
-    doc_id: int
+    doc_id: DocId
     tf: int
     positions: tuple[int, ...] = ()
 
@@ -33,7 +35,7 @@ class Posting:
 class DocMeta:
     """Metadata needed to display search results."""
 
-    doc_id: int
+    doc_id: DocId
     title: str
     path: str
 
@@ -48,16 +50,16 @@ class Index(Mapping[str, list[Posting]]):
     def __init__(
         self,
         postings: dict[str, list[Posting]],
-        doc_lengths: dict[int, int],
-        doc_meta: dict[int, DocMeta],
+        doc_lengths: dict[DocId, int],
+        doc_meta: dict[DocId, DocMeta],
         *,
         has_positions: bool = False,
-        doc_texts: dict[int, str] | None = None,
+        doc_texts: dict[DocId, str] | None = None,
     ) -> None:
         self._postings = postings
         self._doc_lengths = doc_lengths
         self._doc_meta = doc_meta
-        self._doc_texts: dict[int, str] = doc_texts if doc_texts is not None else {}
+        self._doc_texts: dict[DocId, str] = doc_texts if doc_texts is not None else {}
         self.has_positions = has_positions
         self.cache_token: int = next(_INDEX_TOKEN_SEQ)
         self._closed = False
@@ -67,15 +69,15 @@ class Index(Mapping[str, list[Posting]]):
         return self._postings
 
     @property
-    def doc_lengths(self) -> dict[int, int]:
+    def doc_lengths(self) -> dict[DocId, int]:
         return self._doc_lengths
 
     @property
-    def doc_meta(self) -> dict[int, DocMeta]:
+    def doc_meta(self) -> dict[DocId, DocMeta]:
         return self._doc_meta
 
     @property
-    def doc_texts(self) -> dict[int, str]:
+    def doc_texts(self) -> dict[DocId, str]:
         return self._doc_texts
 
     @property
@@ -92,10 +94,10 @@ class Index(Mapping[str, list[Posting]]):
             return 0.0
         return sum(self._doc_lengths.values()) / len(self._doc_lengths)
 
-    def doc_length(self, doc_id: int) -> int:
+    def doc_length(self, doc_id: DocId) -> int:
         return self._doc_lengths[doc_id]
 
-    def doc_text(self, doc_id: int) -> str:
+    def doc_text(self, doc_id: DocId) -> str:
         return self._doc_texts.get(doc_id, "")
 
     def df(self, term: str) -> int:
@@ -125,29 +127,20 @@ class Index(Mapping[str, list[Posting]]):
 InvertedIndex = Index
 
 
-@timed
-def build_index(
-    root: Path,
+def build_index_from_docs(
+    docs: Iterable[Document],
     *,
     include_positions: bool = False,
     store_text: bool = True,
-    limit: int | None = None,
+    on_doc: Callable[[int], None] | None = None,
 ) -> Index:
-    """Build an Index in a single lazy pass over the corpus.
-
-    Because iter_documents yields strictly increasing doc_ids, every term's
-    postings list is naturally sorted by doc_id without a post-sort pass.
-    """
+    """Build an Index in a single pass from any Iterable of Document objects."""
     postings_map: defaultdict[str, list[Posting]] = defaultdict(list)
-    doc_lengths: dict[int, int] = {}
-    doc_meta: dict[int, DocMeta] = {}
-    doc_texts: dict[int, str] = {}
+    doc_lengths: dict[DocId, int] = {}
+    doc_meta: dict[DocId, DocMeta] = {}
+    doc_texts: dict[DocId, str] = {}
 
-    doc_stream = iter_documents(root)
-    if limit is not None:
-        doc_stream = islice(doc_stream, limit)
-
-    for doc in doc_stream:
+    for processed, doc in enumerate(docs, start=1):
         if include_positions:
             term_positions: defaultdict[str, list[int]] = defaultdict(list)
             for pos, token in enumerate(tokenize(doc.text)):
@@ -172,12 +165,37 @@ def build_index(
         if store_text:
             doc_texts[doc.doc_id] = doc.text
 
+        if on_doc is not None:
+            on_doc(processed)
+
     return Index(
         postings=dict(postings_map),
         doc_lengths=doc_lengths,
         doc_meta=doc_meta,
         has_positions=include_positions,
         doc_texts=doc_texts,
+    )
+
+
+@timed
+def build_index(
+    root: Path,
+    *,
+    include_positions: bool = False,
+    store_text: bool = True,
+    limit: int | None = None,
+    on_doc: Callable[[int], None] | None = None,
+) -> Index:
+    """Build an Index in a single lazy pass over a corpus path."""
+    doc_stream: Iterable[Document] = iter_documents(root)
+    if limit is not None:
+        doc_stream = islice(doc_stream, limit)
+
+    return build_index_from_docs(
+        doc_stream,
+        include_positions=include_positions,
+        store_text=store_text,
+        on_doc=on_doc,
     )
 
 

@@ -4,6 +4,8 @@ import inspect
 import json
 from pathlib import Path
 
+import pytest
+
 from findex.corpus import iter_documents
 from findex.stats import compute_stats_eager, compute_stats_lazy
 from findex.tokenize import tokenize, tokenize_spans
@@ -120,3 +122,18 @@ def test_eager_and_lazy_stats_equivalence(tmp_path: Path) -> None:
     assert lazy.total_tokens == eager.total_tokens == 12
     assert lazy.vocab_size == eager.vocab_size
     assert lazy.top_terms == eager.top_terms
+
+    @pytest.mark.parametrize(
+        ("raw_text", "expected"),
+        [
+            ("", []),
+            ("Hello, WORLD!", ["hello", "world"]),
+            ("caf\u00e9 cafe\u0301", ["café", "café"]),
+            ("Straße STRASSE", ["strasse", "strasse"]),
+            ("don't can't п'ять м’ясо", ["don't", "can't", "п'ять", "м’ясо"]),
+            ("state-of-the-art", ["state", "of", "the", "art"]),
+            ("Python3.13 — 2026!", ["python3", "13", "2026"]),
+        ],
+    )
+    def test_tokenize_parametrized_cases(raw_text: str, expected: list[str]) -> None:
+        assert list(tokenize(raw_text)) == expected

@@ -22,7 +22,7 @@ def test_posting_and_docmeta_are_frozen_slotted_and_hashable() -> None:
     assert not hasattr(m1, "__dict__")
 
     with pytest.raises(AttributeError):
-        p1.tf = 5  # type: ignore[misc]
+        p1.tf = 5  # type: ignore[misc] # intentionally mutating frozen dataclass to assert AttributeError
 
 
 def test_build_index_streaming_sorted_with_and_without_positions(tmp_path: Path) -> None:
