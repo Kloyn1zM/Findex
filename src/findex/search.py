@@ -238,6 +238,67 @@ def search(
     return results
 
 
+def search_paginated(
+    index: Index,
+    query: str,
+    *,
+    scorer: Scorer | None = None,
+    page: int = 1,
+    page_size: int = 10,
+    highlight_start: str = "**",
+    highlight_end: str = "**",
+) -> tuple[list[SearchResult], int]:
+    """Run a ranked search returning (page_results, total_matching_docs)."""
+    active_scorer: Scorer = scorer if scorer is not None else BM25()
+    if page < 1 or page_size <= 0 or not query.strip():
+        return [], 0
+
+    tree = parse_query(query)
+    matched_ids = tree.evaluate(index)
+    total = len(matched_ids)
+    if total == 0:
+        return [], 0
+
+    offset = (page - 1) * page_size
+    if offset >= total:
+        return [], total
+
+    fetch_k = min(total, offset + page_size)
+    try:
+        hash(active_scorer)
+    except TypeError:
+        is_hashable = False
+    else:
+        is_hashable = True
+
+    if is_hashable:
+        _INDEX_REGISTRY[index.cache_token] = weakref.ref(index)
+        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, fetch_k)
+    else:
+        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, fetch_k)
+
+    page_pairs = ranked_pairs[offset : offset + page_size]
+    pos_terms = tree.positive_terms()
+    results: list[SearchResult] = []
+    for doc_id, score in page_pairs:
+        meta = index.doc_meta[doc_id]
+        snippet = make_snippet(
+            index.doc_text(doc_id),
+            pos_terms,
+            highlight_start=highlight_start,
+            highlight_end=highlight_end,
+        )
+        results.append(
+            SearchResult(
+                doc_id=doc_id,
+                score=score,
+                title=meta.title,
+                snippet=snippet,
+            )
+        )
+    return results, total
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m findex.search",

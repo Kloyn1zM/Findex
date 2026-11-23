@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}Document #{{ doc_id }} not found — findex{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h1 style="margin-top: 0;">Document #{{ doc_id }} not found</h1>
+  <p>The requested document does not exist in the currently loaded index.</p>
+  <a class="btn btn-primary" href="{{ back_url }}">&larr; Back to search</a>
+</section>
+{% endblock %}

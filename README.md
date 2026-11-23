@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml/badge.svg)](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml)
 
+**Live Demo:** _[Deploy URL — TBD after Render/Railway deploy]_
+
 A full-text search engine built incrementally in Python (3.13+, `uv`, `ruff`, `pyright`, `pytest`) from a constant-memory streaming corpus pipeline to a parallel inverted index, ranked query engine, installable CLI, async web crawler, and FastAPI web service.
 
 ## Corpus
@@ -310,11 +312,11 @@ findex index data/ --out data/index.bin --executor serial
 ## Lab 06 — Asyncio: A Polite, Concurrent Web Crawler
 
 ### What was built
-- **`src/findex/crawler/fetch.py`**: async `httpx` fetcher with `asyncio.timeout`, honest `User-Agent` (`findex-crawler/0.6.0`), bounded retries with exponential backoff + jitter for `429`/`5xx`/timeouts/transient network errors, `Retry-After` header parsing, and zero retries on `404`/`403`.
+- **`src/findex/crawler/fetch.py`**: async `httpx` fetcher with `asyncio.timeout`, honest `User-Agent` with contact address (`findex-crawler/0.6.0 (+https://github.com/Kloyn1zM/Findex; mailto:kam09086@gmail.com)`), bounded retries with exponential backoff + jitter for `429`/`5xx`/timeouts/transient network errors, `Retry-After` header parsing (for `429`/`503`), and zero retries on `404`/`403`.
 - **`src/findex/crawler/robots.py`**: `RobotsCache` that fetches and parses `robots.txt` asynchronously via `httpx.AsyncClient` once per `(scheme, host)` (guarded by per-host `asyncio.Lock` so concurrent workers never duplicate requests).
-- **`src/findex/crawler/crawl.py`**: structured-concurrency crawler using an `asyncio.Queue` frontier, `asyncio.TaskGroup` workers, global + per-host `asyncio.Semaphore` limits, per-host politeness delay, URL canonicalization (lowercased scheme/host, fragment removal, sorted query params, binary asset filtering), `HTMLParser`-based text/link extraction, streaming `AsyncIterator[Page]` output, and per-URL JSON-lines `crawl.log`.
+- **`src/findex/crawler/crawl.py`**: structured-concurrency crawler using an `asyncio.Queue` frontier, `asyncio.TaskGroup` workers, global + per-host `asyncio.Semaphore` limits, per-host politeness delay, URL canonicalization (lowercased scheme/host, fragment removal, sorted query params, binary asset filtering), incremental chunked `HTMLParser` extraction (`extract_html_async` yielding via `await asyncio.sleep(0)` between 32 KiB slices so the event loop never stalls even in `debug=True`), streaming `AsyncIterator[Page]` output, and per-URL JSON-lines `crawl.log`.
 - **`src/findex/cli.py`**: added `findex crawl` streaming pages directly into `.jsonl` (immediately consumable by `findex index` and `findex search`) with a `rich.live.Live` progress table and `--debug-asyncio` flag.
-- **`tests/test_crawler.py`**: 6 offline tests using `httpx.MockTransport` and `asyncio.run(..., debug=True)` verifying retry/404/timeout logic, `robots.txt` caching and enforcement, URL canonicalization, `max_pages` cap, domain boundaries, and end-to-end indexing of crawled output.
+- **`tests/test_crawler.py`**: 7 offline tests using `httpx.MockTransport` and `asyncio.run(..., debug=True)` verifying retry/404/timeout logic, contact `User-Agent`, non-blocking HTML parsing under `debug=True`, `robots.txt` caching and enforcement, URL canonicalization, `max_pages` cap, domain boundaries, and end-to-end indexing of crawled output.
 
 ### Target site & politeness policy
 - **Target**: `https://docs.python.org/3/library/` (official Python 3 standard library documentation).
@@ -331,9 +333,9 @@ findex index data/ --out data/index.bin --executor serial
 | 20 | `per_host=2, delay=0.10s` | 200 | 22.25 | 8.99 | 0 | 66.4 MiB |
 
 **Key observations:**
-- **Scaling & memory**: moving from `concurrency=1` to `concurrency=5` nearly doubled throughput (`7.60 → 13.96 pages/s`) while keeping Peak RSS almost flat (**63.5 → 65.0 MiB**), because coroutines share a single process and stream pages directly to disk.
-- **Per-host politeness cap**: with `concurrency=20` constrained to `per_host=2, delay=0.10s` on a single host, throughput is intentionally bounded to **8.99 pages/s** (`1 / 0.10s ≈ 10 req/s` ceiling), confirming that per-host rate limiting works even when global concurrency is high.
-- **Event-loop insight (`debug=True`)**: running with `asyncio.run(..., debug=True)` logged slow callbacks (`0.10–0.40 s`) inside `_worker` on very large HTML reference pages, because `HTMLParser` runs synchronously on the event-loop thread. That CPU-bound parsing plus single-host contention explains why `concurrency=20` (`11.82 pages/s`) slightly trailed `concurrency=5` (`13.96 pages/s`). Offloading `extract_html()` via `asyncio.to_thread()` would eliminate those stalls at higher concurrency.
+- **Why 20 concurrent requests in one `asyncio` thread outperform Lab 5's process approach:** crawling spends >95% of wall time waiting on network sockets (DNS, TLS, HTTP RTT). Spawning 20 OS processes as in Lab 5 would burn hundreds of MiB in interpreter startup and IPC overhead while sitting idle on sockets, whereas a single `asyncio` event loop multiplexes 20 in-flight requests in ~**65 MiB** flat RSS with microsecond coroutine switching and shared HTTP keep-alive connection pooling.
+- **Cost and purpose of the per-host limit:** with `concurrency=20` constrained to `per_host=2, delay=0.10s` on a single host, throughput drops from **13.96** to **8.99 pages/s** (`1 / 0.10s ≈ 10 req/s` ceiling). That slowdown is intentional: without per-host limits, global concurrency would hammer a single origin, trigger `429` throttling or IP bans, and violate crawling etiquette — while multi-host crawls still scale across distinct domains.
+- **Why indexing stays outside the event loop & `debug=True` verification:** if CPU-bound Unicode normalization, regex tokenization, and posting-list updates ran directly inside a crawler coroutine, every `build_index` step would monopolize the single event-loop thread, starving all pending socket reads/timers and triggering cascading request timeouts. Similarly, initial profiling with `asyncio.run(..., debug=True)` caught `0.10–0.40 s` slow callbacks when `HTMLParser` parsed huge reference pages in one synchronous pass; feeding `HTMLParser` incrementally in 32 KiB slices (`extract_html_async` with `await asyncio.sleep(0)`) eliminated those stalls so `debug=True` reports zero slow-callback warnings, while `findex crawl` streams JSONL to disk for offline `findex index`.
 
 ### Sample handled failures (404 & timeout with retry/backoff)
 
@@ -363,4 +365,70 @@ findex index data/ --out data/index.bin --executor serial
 findex crawl https://docs.python.org/3/library/ --max-pages 50 --concurrency 5 --per-host 2 --delay 0.1 --out data/crawl.jsonl
 findex index data/crawl.jsonl --out data/crawl.bin --positions
 findex search data/crawl.bin "asyncio" --k 5
+~~~
+
+---
+
+## Lab 07 — HTTP Search Service (`FastAPI`, `Pydantic v2`, `Jinja2`, `Docker`)
+
+### What was built
+- **`src/findex/web/` package**:
+  - **`settings.py`**: environment-driven `Settings(BaseSettings)` (`pydantic-settings`) reading `INDEX_PATH`, optional `INDEX_URL` (auto-downloads missing index on startup with redirect support & atomic rename), `HOST`, `PORT`, `WORKERS`, and `LOG_LEVEL`.
+  - **`schemas.py`**: Pydantic v2 HTTP boundary models (`HealthResponse`, `SearchResponse`, `SearchHit`, `DocumentResponse`, `StatsResponse`, `TermStat`, `ErrorResponse`); internal domain objects remain Lab 2–3 dataclasses (`Index`, `Posting`, `DocMeta`, `SearchResult`).
+  - **`deps.py`**: `Depends(get_index)` and `Depends(get_optional_index)` providers raising HTTP `503` whenever the index is not yet loaded.
+  - **`app.py`**: FastAPI factory (`create_app`) with `lifespan` loading `Settings.index_path` once and closing cleanly on shutdown; request-context middleware injecting `X-Request-ID` / `X-Process-Time-Ms` and catching unexpected exceptions (logging full traceback with `request_id` while returning sanitized JSON `500` without stack traces).
+  - **`templates/`**: server-side Jinja2 templates (`base.html`, `index.html`, `document.html`, `not_found.html`) with query form, XSS-safe `<mark>` snippet highlighting, relevance scores, Prev/Next pagination, and full document viewer (`GET /view/{doc_id}`).
+- **REST & Web endpoints**:
+  - `GET /` — server-rendered Jinja2 search page with pagination and highlighted snippets.
+  - `GET /view/{doc_id}` — Jinja2 HTML document viewer (`404` HTML page if absent).
+  - `GET /health` — readiness probe returning `200` with index counts and uptime, or `503` when the index is not loaded.
+  - `GET /search?q=...&k=10&scorer=bm25|tfidf&page=1` — validated, paginated ranked boolean/phrase search (`400` on blank/malformed queries or phrase queries without positions, `422` on invalid query parameters).
+  - `GET /docs/{doc_id}` — full document metadata and text (`404` JSON when absent).
+  - `GET /stats?top=20` — index summary statistics and top terms.
+  - `GET /docs` & `GET /openapi.json` — auto-generated OpenAPI schema and Swagger UI.
+- **`src/findex/cli.py`**: updated `findex serve [INDEX_PATH] --host 127.0.0.1 --port 8000 --workers N` backed by `uvicorn` factory mode (`findex.web.app:create_app`), falling back to `INDEX_PATH` / `PORT` / `WORKERS` env vars.
+- **`Dockerfile` & `.dockerignore`**: two-stage build pinned to `uv.lock` (`uv sync --frozen --no-dev`), non-root `appuser`, `/health` `HEALTHCHECK`, and environment-only configuration (`INDEX_PATH`, `PORT`, `WORKERS`) ready for Render, Fly.io, or Railway.
+- **`tests/test_api.py`**: 7 tests using `TestClient` and `app.dependency_overrides` on an in-memory `Index` (zero disk index required) verifying `/health -> 503`, paginated `/search`, `400`/`404`/`422`, `500` with `request_id` (no traceback), Jinja2 UI + XSS escaping, `Settings` env loading, and `findex serve --workers` CLI handling.
+
+### `def` vs `async def` check (20 concurrent requests on `/search`)
+
+20 distinct concurrent queries fired simultaneously against a single `uvicorn` worker (5,000-doc / 129,327-term index), plus `/health` responsiveness measured during the burst:
+
+| Handler kind | 20-request burst wall (ms) | Burst p50 (ms) | Burst p95 (ms) | Max `/health` latency during burst (ms) | Kept in code? |
+|---|---:|---:|---:|---:|---|
+| `async def` (blocks event loop) | 289.5 | 230.9 | 253.5 | 269.2 | No |
+| `def` (AnyIO threadpool) | 312.5 | 269.1 | 281.8 | **243.4** | **Yes** |
+
+### Load benchmark (200 mixed requests @ concurrency=20, 5,000-doc index)
+
+Measured locally via `httpx.AsyncClient` (200 mixed BM25/TF-IDF paginated queries, `0` errors across all runs; ready to cross-check with `oha` against the deployed URL):
+
+| Configuration | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) |
+|---|---:|---:|---:|---:|
+| 1 worker (`async def`) | 84.5 | 208.0 | 338.5 | 398.5 |
+| 1 worker (`def`) | 77.6 | 220.1 | 450.8 | 685.6 |
+| 4 workers (`def`, `--workers 4`) | **130.1** | **137.6** | **208.7** | **244.6** |
+| Deployed service (Render / Railway) | _TBD after deploy_ | _TBD_ | _TBD_ | _TBD_ |
+
+**Connecting the numbers to Labs 5–6:**
+- **Event loop vs threadpool (Lab 6 + Lab 5):** defining `/search` as `async def` executes synchronous BM25 scoring and snippet extraction directly on the single `asyncio` event-loop thread, delaying concurrent `/health` probes (`269.2 ms` during a 20-request burst). Defining `/search` as `def` delegates work to AnyIO's threadpool so the event loop stays responsive (`243.4 ms` `/health` during burst), **but** because Python scoring is CPU-bound under CPython's GIL, worker threads inside a single process still serialize and pay GIL contention overhead — exactly as observed in Lab 5's `ThreadPoolExecutor` (`77.6` vs `84.5 req/s`, higher `p99` tail of `685.6 ms`).
+- **Multi-process scaling (Lab 5):** running `findex serve --workers 4` launches 4 independent Python interpreters with separate GILs and event loops (matching Lab 5's `ProcessPoolExecutor`), lifting throughput by **1.68×** (`77.6 → 130.1 req/s`) and cutting `p95` (`450.8 → 208.7 ms`) and `p99` (`685.6 → 244.6 ms`) by more than **2×**.
+
+### Running Lab 07
+
+~~~bash
+# Local CLI (single or multi-worker)
+findex serve data/index.bin --host 127.0.0.1 --port 8000 --workers 4
+
+# Or via environment variables
+INDEX_PATH=data/index.bin PORT=8000 findex serve
+
+# Docker (two-stage non-root build)
+docker build -t findex:latest .
+docker run --rm -p 8000:8000 -v "$PWD/data:/data:ro" -e INDEX_PATH=/data/index.bin findex:latest
+
+# Sample requests
+curl "http://127.0.0.1:8000/search?q=python&k=5&page=1&scorer=bm25"
+curl "http://127.0.0.1:8000/docs/1570"
+curl "http://127.0.0.1:8000/health"
 ~~~
