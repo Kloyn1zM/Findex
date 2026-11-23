@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} — findex{% endblock %}
+
+{% block content %}
+<div class="meta-bar" style="margin-top: 0;">
+  <a class="btn btn-secondary" href="{{ back_url }}">&larr; Back to search</a>
+  <a class="btn btn-secondary" href="/docs/{{ doc_id }}">View JSON</a>
+</div>
+
+<article class="card">
+  <h1 style="margin: 0 0 0.65rem; font-size: 1.5rem;">{{ title }}</h1>
+  <div class="hit-badges" style="flex-wrap: wrap;">
+    <span class="pill">Doc ID #{{ doc_id }}</span>
+    <span class="pill">{{ "{:,}".format(length) }} tokens</span>
+    <span class="pill">{{ path }}</span>
+  </div>
+  <div class="doc-body">{{ text }}</div>
+</article>
+{% endblock %}

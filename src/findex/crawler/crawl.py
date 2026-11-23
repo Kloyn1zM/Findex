@@ -186,6 +186,38 @@ def extract_html(html: str, base_url: str) -> tuple[str, str, list[str]]:
     return parser.title, parser.text, links
 
 
+async def extract_html_async(
+    html: str,
+    base_url: str,
+    *,
+    chunk_size: int = 16_384,
+) -> tuple[str, str, list[str]]:
+    """Incrementally parse HTML in chunks, yielding to the event loop between slices.
+
+    Because stdlib HTMLParser is pure Python (holding the GIL even inside asyncio.to_thread),
+    cooperative chunked feeding keeps every event-loop callback short (<10 ms) with zero
+    slow-callback warnings under asyncio debug=True.
+    """
+    parser = _HTMLExtractor()
+    try:
+        for offset in range(0, len(html), chunk_size):
+            parser.feed(html[offset : offset + chunk_size])
+            if offset + chunk_size < len(html):
+                await asyncio.sleep(0)
+        parser.close()
+    except Exception:  # noqa: BLE001 — tolerate severely malformed HTML pages
+        log.debug("Recovered from malformed HTML while parsing %s", base_url)
+
+    links: list[str] = []
+    for idx, raw_href in enumerate(parser.links, start=1):
+        canon = canonicalize_url(raw_href, base_url=base_url)
+        if canon is not None:
+            links.append(canon)
+        if idx % 500 == 0:
+            await asyncio.sleep(0)
+    return parser.title, parser.text, links
+
+
 def _domain_allowed(url: str, allowed_domains: set[str]) -> bool:
     host = (urlparse(url).hostname or "").lower()
     if not host:
@@ -330,7 +362,7 @@ async def crawl(
                 if "html" not in res.content_type.lower() and res.content_type:
                     continue
 
-                title, text, links = extract_html(res.text, base_url=res.final_url)
+                title, text, links = await extract_html_async(res.text, res.final_url)
                 if not text:
                     continue
 

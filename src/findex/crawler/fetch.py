@@ -12,7 +12,9 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "findex-crawler/0.6.0 (+https://github.com/Kloyn1zM/Findex)"
+DEFAULT_USER_AGENT = (
+    "findex-crawler/0.6.0 (+https://github.com/Kloyn1zM/Findex; mailto:kam09086@gmail.com)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +90,7 @@ async def fetch(
             elapsed = time.perf_counter() - t0
 
             if _should_retry_status(resp.status_code) and attempt < max_attempts - 1:
-                if resp.status_code == 429:
+                if resp.status_code in {429, 503}:
                     retry_after = parse_retry_after(resp.headers.get("retry-after"))
                     if retry_after is not None:
                         retry_delay = min(max_backoff, retry_after)

@@ -4,6 +4,7 @@ import asyncio
 import heapq
 import json
 import logging
+import os
 import sys
 import time
 from enum import StrEnum
@@ -476,4 +477,70 @@ def crawl_cmd(
         f"Crawled [bold]{stats.pages_fetched:,}[/bold] pages "
         f"({stats.pages_per_sec:.2f} pages/s, errors={stats.errors}) -> {out} "
         f"(log: {log_file})"
+    )
+
+
+@app.command(name="serve")
+def serve_cmd(
+    index_path: Annotated[
+        Path | None,
+        typer.Argument(help="Path to a saved findex index file (falls back to INDEX_PATH env)."),
+    ] = None,
+    host: Annotated[
+        str | None,
+        typer.Option("--host", help="Bind host address (default: HOST env or 127.0.0.1)."),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            "-p",
+            min=1,
+            max=65535,
+            help="Listening TCP port (default: PORT env or 8000).",
+        ),
+    ] = None,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            "-w",
+            min=1,
+            help="Number of uvicorn worker processes (default: WORKERS env or 1).",
+        ),
+    ] = None,
+) -> None:
+    """Start the FastAPI HTTP search service for a persisted index."""
+    import uvicorn
+
+    from findex.web.settings import Settings
+
+    cfg = Settings()
+    resolved_index = index_path if index_path is not None else cfg.index_path
+    resolved_host = host if host is not None else cfg.host
+    resolved_port = port if port is not None else cfg.port
+    resolved_workers = workers if workers is not None else cfg.workers
+
+    if resolved_index is None:
+        stderr_console.print(
+            "[red]Error:[/red] No index path provided. Pass INDEX_PATH argument or set INDEX_PATH."
+        )
+        raise typer.Exit(code=1)
+    if not resolved_index.exists() and not cfg.index_url:
+        stderr_console.print(f"[red]Error:[/red] Index file not found: {resolved_index}")
+        raise typer.Exit(code=1)
+
+    os.environ["INDEX_PATH"] = str(resolved_index.resolve())
+
+    stdout_console.print(
+        f"Serving [bold]{resolved_index}[/bold] at "
+        f"[cyan]http://{resolved_host}:{resolved_port}[/cyan] "
+        f"(workers={resolved_workers}, OpenAPI: /docs)"
+    )
+    uvicorn.run(
+        "findex.web.app:create_app",
+        factory=True,
+        host=resolved_host,
+        port=resolved_port,
+        workers=resolved_workers,
     )

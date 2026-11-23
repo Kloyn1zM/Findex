@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from findex.corpus import iter_documents
 from findex.crawler.crawl import CrawlStats, Page, canonicalize_url, crawl
@@ -227,3 +228,43 @@ def test_crawl_respects_robots_domains_dedup_max_pages_and_feeds_index(tmp_path:
     ix = build_index(jsonl_path, include_positions=True)
     assert ix.num_docs == 3
     assert "async" in ix or "coroutines" in ix or "semaphores" in ix
+
+
+def test_user_agent_includes_contact_and_debug_mode_does_not_block_event_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert "kam09086@gmail.com" in DEFAULT_USER_AGENT
+
+    big_paragraphs = "".join(
+        f"<p>Paragraph {i}: asyncio event loop coroutine non-blocking parsing test.</p>"
+        for i in range(4_000)
+    )
+    big_html_bytes = (
+        f"<html><head><title>Huge Page</title></head><body>{big_paragraphs}</body></html>"
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, content=big_html_bytes, headers={"content-type": "text/html"})
+
+    async def _run() -> list[Page]:
+        pages: list[Page] = []
+        async for page in crawl(
+            ["https://huge.test/"],
+            max_pages=1,
+            concurrency=2,
+            per_host=2,
+            delay=0.0,
+            transport=httpx.MockTransport(handler),
+        ):
+            pages.append(page)
+        return pages
+
+    with caplog.at_level("WARNING", logger="asyncio"):
+        pages = asyncio.run(_run(), debug=True)
+
+    assert len(pages) == 1
+    assert pages[0].title == "Huge Page"
+    slow_warnings = [rec.getMessage() for rec in caplog.records if "took" in rec.getMessage()]
+    assert slow_warnings == []

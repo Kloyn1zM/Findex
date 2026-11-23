@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}{% if q %}{{ q }} — {% endif %}findex Search{% endblock %}
+
+{% block content %}
+<section class="card">
+  <form class="search-form" method="get" action="/">
+    <input
+      class="search-input"
+      type="text"
+      name="q"
+      value="{{ q }}"
+      placeholder='Search corpus... e.g. python AND (async OR await) or "solar system"'
+      aria-label="Search query"
+      autofocus
+    />
+    <select class="search-select" name="scorer" aria-label="Ranking scorer">
+      <option value="bm25" {% if scorer == "bm25" %}selected{% endif %}>BM25</option>
+      <option value="tfidf" {% if scorer == "tfidf" %}selected{% endif %}>TF-IDF</option>
+    </select>
+    <select class="search-select" name="k" aria-label="Results per page">
+      <option value="5" {% if k == 5 %}selected{% endif %}>5 / page</option>
+      <option value="10" {% if k == 10 %}selected{% endif %}>10 / page</option>
+      <option value="20" {% if k == 20 %}selected{% endif %}>20 / page</option>
+    </select>
+    <input type="hidden" name="page" value="1" />
+    <button class="btn btn-primary" type="submit">Search</button>
+  </form>
+
+  <div class="hint-box">
+    {% if index_ready %}
+      Indexed <strong>{{ "{:,}".format(num_docs) }}</strong> documents and
+      <strong>{{ "{:,}".format(vocab_size) }}</strong> unique terms.
+      Supports <code>AND</code>, <code>OR</code>, <code>NOT</code>, parentheses <code>(...)</code>,
+      and <code>"quoted phrases"</code>.
+    {% else %}
+      Index status: <strong>not loaded</strong>.
+    {% endif %}
+  </div>
+</section>
+
+{% if error_msg %}
+  <div class="alert-error" role="alert">{{ error_msg }}</div>
+{% elif q.strip() %}
+  <div class="meta-bar">
+    <div>
+      <strong>{{ "{:,}".format(total) }}</strong> matching document(s) for
+      <code>{{ q.strip() }}</code>
+      {% if total_pages > 0 %}
+        &middot; Page <strong>{{ page }}</strong> of <strong>{{ total_pages }}</strong>
+      {% endif %}
+    </div>
+    <div>
+      <span class="pill">{{ scorer|upper }}</span>
+      <span class="pill">{{ "%.2f"|format(elapsed_ms) }} ms</span>
+    </div>
+  </div>
+
+  {% if hits %}
+    <div class="results-list">
+      {% for hit in hits %}
+        <article class="hit-card">
+          <div class="hit-header">
+            <h2 class="hit-title">
+              <a href="{{ hit.view_url }}">{{ hit.rank }}. {{ hit.title }}</a>
+            </h2>
+            <div class="hit-badges">
+              <span class="pill pill-score">score {{ "%.4f"|format(hit.score) }}</span>
+              <span class="pill">id #{{ hit.doc_id }}</span>
+            </div>
+          </div>
+          <p class="snippet">{{ hit.snippet_html }}</p>
+        </article>
+      {% endfor %}
+    </div>
+
+    {% if total_pages > 1 %}
+      <nav class="pagination" aria-label="Search results pagination">
+        {% if prev_url %}
+          <a class="btn btn-secondary" href="{{ prev_url }}">&larr; Previous</a>
+        {% else %}
+          <span class="btn btn-disabled">&larr; Previous</span>
+        {% endif %}
+
+        <span class="pill">Page {{ page }} / {{ total_pages }}</span>
+
+        {% if next_url %}
+          <a class="btn btn-secondary" href="{{ next_url }}">Next &rarr;</a>
+        {% else %}
+          <span class="btn btn-disabled">Next &rarr;</span>
+        {% endif %}
+      </nav>
+    {% endif %}
+  {% else %}
+    <div class="card" style="margin-top: 0.75rem;">
+      No documents matched your query{% if page > 1 %} on page {{ page }}{% endif %}.
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}
