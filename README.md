@@ -304,3 +304,63 @@ findex index data/ --out data/index.bin --executor processes --workers 4
 findex index data/ --out data/index.bin --executor threads --workers 4
 findex index data/ --out data/index.bin --executor serial
 ~~~
+
+---
+
+## Lab 06 — Asyncio: A Polite, Concurrent Web Crawler
+
+### What was built
+- **`src/findex/crawler/fetch.py`**: async `httpx` fetcher with `asyncio.timeout`, honest `User-Agent` (`findex-crawler/0.6.0`), bounded retries with exponential backoff + jitter for `429`/`5xx`/timeouts/transient network errors, `Retry-After` header parsing, and zero retries on `404`/`403`.
+- **`src/findex/crawler/robots.py`**: `RobotsCache` that fetches and parses `robots.txt` asynchronously via `httpx.AsyncClient` once per `(scheme, host)` (guarded by per-host `asyncio.Lock` so concurrent workers never duplicate requests).
+- **`src/findex/crawler/crawl.py`**: structured-concurrency crawler using an `asyncio.Queue` frontier, `asyncio.TaskGroup` workers, global + per-host `asyncio.Semaphore` limits, per-host politeness delay, URL canonicalization (lowercased scheme/host, fragment removal, sorted query params, binary asset filtering), `HTMLParser`-based text/link extraction, streaming `AsyncIterator[Page]` output, and per-URL JSON-lines `crawl.log`.
+- **`src/findex/cli.py`**: added `findex crawl` streaming pages directly into `.jsonl` (immediately consumable by `findex index` and `findex search`) with a `rich.live.Live` progress table and `--debug-asyncio` flag.
+- **`tests/test_crawler.py`**: 6 offline tests using `httpx.MockTransport` and `asyncio.run(..., debug=True)` verifying retry/404/timeout logic, `robots.txt` caching and enforcement, URL canonicalization, `max_pages` cap, domain boundaries, and end-to-end indexing of crawled output.
+
+### Target site & politeness policy
+- **Target**: `https://docs.python.org/3/library/` (official Python 3 standard library documentation).
+- **`robots.txt` compliance**: `https://docs.python.org/robots.txt` permits crawling `/3/library/` while disallowing legacy versions and internal search endpoints. `RobotsCache` fetches `robots.txt` once before any page request and checks every candidate URL.
+- **Politeness controls**: identifiable `User-Agent`, per-host concurrency cap (`--per-host`), per-host request spacing (`--delay`), strict `--max-pages` cap, and same-domain restriction by default.
+
+### M4: Live crawl benchmark (200 pages from `docs.python.org/3/library/`)
+
+| Concurrency | Per-host / Delay | Pages | Wall (s) | Throughput (pages/s) | Errors | Peak RSS |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `per_host=1, delay=0.02s` | 200 | 26.33 | 7.60 | 0 | 63.5 MiB |
+| 5 | `per_host=5, delay=0.02s` | 200 | 14.33 | **13.96** | 0 | 65.0 MiB |
+| 20 | `per_host=20, delay=0.02s` | 200 | 16.92 | 11.82 | 0 | 65.2 MiB |
+| 20 | `per_host=2, delay=0.10s` | 200 | 22.25 | 8.99 | 0 | 66.4 MiB |
+
+**Key observations:**
+- **Scaling & memory**: moving from `concurrency=1` to `concurrency=5` nearly doubled throughput (`7.60 → 13.96 pages/s`) while keeping Peak RSS almost flat (**63.5 → 65.0 MiB**), because coroutines share a single process and stream pages directly to disk.
+- **Per-host politeness cap**: with `concurrency=20` constrained to `per_host=2, delay=0.10s` on a single host, throughput is intentionally bounded to **8.99 pages/s** (`1 / 0.10s ≈ 10 req/s` ceiling), confirming that per-host rate limiting works even when global concurrency is high.
+- **Event-loop insight (`debug=True`)**: running with `asyncio.run(..., debug=True)` logged slow callbacks (`0.10–0.40 s`) inside `_worker` on very large HTML reference pages, because `HTMLParser` runs synchronously on the event-loop thread. That CPU-bound parsing plus single-host contention explains why `concurrency=20` (`11.82 pages/s`) slightly trailed `concurrency=5` (`13.96 pages/s`). Offloading `extract_html()` via `asyncio.to_thread()` would eliminate those stalls at higher concurrency.
+
+### Sample handled failures (404 & timeout with retry/backoff)
+
+~~~json
+{
+  "not_found": {
+    "status": 404,
+    "attempts": 1,
+    "elapsed_ms": 285.4,
+    "error": "HTTP 404"
+  },
+  "timeout_retry": {
+    "url": "https://docs.python.org/3/library/asyncio.html",
+    "status": null,
+    "attempts": 3,
+    "elapsed_ms": 1551.99,
+    "error": "Timeout: "
+  }
+}
+~~~
+
+`404` failed fast on attempt 1 (zero wasted retries), while the simulated timeout retried twice with exponential backoff + jitter (`0.34 s`, `1.19 s`) before recording the error and continuing without crashing the crawler.
+
+### Running Lab 06
+
+~~~bash
+findex crawl https://docs.python.org/3/library/ --max-pages 50 --concurrency 5 --per-host 2 --delay 0.1 --out data/crawl.jsonl
+findex index data/crawl.jsonl --out data/crawl.bin --positions
+findex search data/crawl.bin "asyncio" --k 5
+~~~

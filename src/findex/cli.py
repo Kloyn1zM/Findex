@@ -1,5 +1,6 @@
 """Installable CLI for findex built with Typer, Rich, and standard logging (Lab 4–5)."""
 
+import asyncio
 import heapq
 import json
 import logging
@@ -11,10 +12,13 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.text import Text
 
+from findex.crawler.crawl import CrawlStats
+from findex.crawler.crawl import crawl as run_crawl
 from findex.index import build_index
 from findex.parallel import ExecutorKind
 from findex.query import QuerySyntaxError
@@ -362,3 +366,114 @@ def stats_cmd(
     for rank, (term, tf_sum) in enumerate(top_terms, start=1):
         terms_table.add_row(str(rank), term, f"{tf_sum:,}")
     stdout_console.print(terms_table)
+
+
+def _build_crawl_live_table(stats: CrawlStats, max_pages: int) -> Table:
+    table = Table(title="findex crawl — live progress")
+    table.add_column("Metric", style="bold cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Pages fetched", f"{stats.pages_fetched:,} / {max_pages:,}")
+    table.add_row("Throughput", f"{stats.pages_per_sec:.2f} pages/s")
+    table.add_row("In-flight", str(stats.in_flight))
+    table.add_row("Queue depth", f"{stats.queue_depth:,}")
+    table.add_row("Errors", str(stats.errors))
+    table.add_row("Skipped (robots.txt)", str(stats.skipped_robots))
+    return table
+
+
+@app.command(name="crawl")
+def crawl_cmd(
+    seed_url: Annotated[str, typer.Argument(help="Starting seed URL to crawl.")],
+    max_pages: Annotated[
+        int,
+        typer.Option("--max-pages", min=1, help="Maximum number of pages to save."),
+    ] = 500,
+    concurrency: Annotated[
+        int,
+        typer.Option("--concurrency", "-c", min=1, help="Global concurrent worker tasks."),
+    ] = 10,
+    per_host: Annotated[
+        int,
+        typer.Option("--per-host", min=1, help="Maximum concurrent requests per host."),
+    ] = 2,
+    delay: Annotated[
+        float,
+        typer.Option("--delay", min=0.0, help="Minimum delay (seconds) between requests per host."),
+    ] = 0.2,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", min=0.5, help="Per-request timeout in seconds."),
+    ] = 10.0,
+    out: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Streaming JSON-lines output file."),
+    ] = Path("data/crawl.jsonl"),
+    log_file: Annotated[
+        Path,
+        typer.Option("--log-file", help="Per-URL crawl log file (JSON-lines)."),
+    ] = Path("data/crawl.log"),
+    domain: Annotated[
+        list[str] | None,
+        typer.Option("--domain", help="Allowed domain(s); defaults to seed URL host."),
+    ] = None,
+    debug_asyncio: Annotated[
+        bool,
+        typer.Option("--debug-asyncio", help="Run asyncio event loop in debug mode."),
+    ] = False,
+) -> None:
+    """Politely crawl web pages asynchronously and stream them into a JSON-lines corpus."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    stats = CrawlStats()
+
+    async def _execute() -> None:
+        with (
+            out.open("w", encoding="utf-8") as out_fh,
+            Live(
+                _build_crawl_live_table(stats, max_pages),
+                console=stderr_console,
+                refresh_per_second=6,
+                transient=True,
+            ) as live,
+        ):
+            async for page in run_crawl(
+                [seed_url],
+                max_pages=max_pages,
+                concurrency=concurrency,
+                per_host=per_host,
+                delay=delay,
+                timeout=timeout,
+                allowed_domains=domain,
+                crawl_log_path=log_file,
+                stats=stats,
+            ):
+                record = {
+                    "url": page.url,
+                    "title": page.title,
+                    "text": page.text,
+                    "fetched_at": page.fetched_at,
+                }
+                out_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out_fh.flush()
+                live.update(_build_crawl_live_table(stats, max_pages))
+
+    try:
+        asyncio.run(_execute(), debug=debug_asyncio)
+    except KeyboardInterrupt:
+        stderr_console.print("[yellow]Crawl interrupted by user.[/yellow]")
+        raise typer.Exit(code=130) from None
+    except (OSError, ValueError) as exc:
+        stderr_console.print(f"[red]Error:[/red] Crawl failed: {exc}")
+        raise typer.Exit(code=1) from None
+
+    log.info(
+        "Crawled %d pages (%.2f pages/s, %d errors) -> %s",
+        stats.pages_fetched,
+        stats.pages_per_sec,
+        stats.errors,
+        out,
+    )
+    stdout_console.print(
+        f"Crawled [bold]{stats.pages_fetched:,}[/bold] pages "
+        f"({stats.pages_per_sec:.2f} pages/s, errors={stats.errors}) -> {out} "
+        f"(log: {log_file})"
+    )
