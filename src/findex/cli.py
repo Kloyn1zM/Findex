@@ -14,7 +14,14 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.live import Live
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -25,6 +32,14 @@ from findex.parallel import ExecutorKind
 from findex.query import QuerySyntaxError
 from findex.scoring import BM25, Scorer, TfIdf
 from findex.search import search as run_search
+from findex.semantic import (
+    DEFAULT_EMBEDDING_MODEL,
+    SemanticIndex,
+    SentenceTransformerEmbedder,
+    build_semantic_index,
+    hybrid_search,
+    semantic_search,
+)
 from findex.store import StorageFormat, open_index, save
 
 log = logging.getLogger(__name__)
@@ -56,6 +71,12 @@ class ExecutorChoice(StrEnum):
     serial = "serial"
     threads = "threads"
     processes = "processes"
+
+
+class ModeChoice(StrEnum):
+    keyword = "keyword"
+    semantic = "semantic"
+    hybrid = "hybrid"
 
 
 def _configure_logging(verbosity: int) -> None:
@@ -244,8 +265,16 @@ def search_cmd(
     k: Annotated[int, typer.Option("--k", "-k", min=1, help="Maximum results to return.")] = 10,
     scorer: Annotated[
         ScorerChoice,
-        typer.Option("--scorer", help="Ranking algorithm."),
+        typer.Option("--scorer", help="Keyword ranking algorithm."),
     ] = ScorerChoice.bm25,
+    mode: Annotated[
+        ModeChoice,
+        typer.Option("--mode", help="Search mode: keyword, semantic, or hybrid (RRF)."),
+    ] = ModeChoice.keyword,
+    embeddings: Annotated[
+        Path | None,
+        typer.Option("--embeddings", help="Path to .npy embeddings (for semantic/hybrid)."),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit results as JSON lines to stdout for piping."),
@@ -263,22 +292,53 @@ def search_cmd(
     try:
         t0 = time.perf_counter()
         with open_index(index_path) as ix:
-            results = run_search(
-                ix,
-                query,
-                scorer=active_scorer,
-                k=k,
-                highlight_start=hl_start,
-                highlight_end=hl_end,
-            )
+            if mode is ModeChoice.keyword:
+                results = run_search(
+                    ix,
+                    query,
+                    scorer=active_scorer,
+                    k=k,
+                    highlight_start=hl_start,
+                    highlight_end=hl_end,
+                )
+            else:
+                if embeddings is None:
+                    stderr_console.print(
+                        "[red]Error:[/red] --embeddings is required for semantic/hybrid mode."
+                    )
+                    raise typer.Exit(code=1)
+                sem_ix = SemanticIndex.load(embeddings)
+                embedder = SentenceTransformerEmbedder(sem_ix.model_name)
+                if mode is ModeChoice.semantic:
+                    results = semantic_search(
+                        ix,
+                        sem_ix,
+                        embedder,
+                        query,
+                        k=k,
+                        highlight_start=hl_start,
+                        highlight_end=hl_end,
+                    )
+                else:
+                    results = hybrid_search(
+                        ix,
+                        sem_ix,
+                        embedder,
+                        query,
+                        scorer=active_scorer,
+                        k=k,
+                        highlight_start=hl_start,
+                        highlight_end=hl_end,
+                    )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    except (QuerySyntaxError, ValueError, OSError, TypeError) as exc:
+    except (QuerySyntaxError, ValueError, OSError, TypeError, RuntimeError) as exc:
         stderr_console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from None
 
     log.info(
-        "Query %r (%s) returned %d hits in %.2f ms",
+        "Query %r (mode=%s, scorer=%s) returned %d hits in %.2f ms",
         query,
+        mode.value,
         scorer.value,
         len(results),
         elapsed_ms,
@@ -300,7 +360,11 @@ def search_cmd(
         stdout_console.print(f"No matches for [bold]{query!r}[/bold].")
         return
 
-    table = Table(title=f"Results for {query!r} (scorer={scorer.value}, {elapsed_ms:.1f} ms)")
+    table = Table(
+        title=(
+            f"Results for {query!r} (mode={mode.value}, scorer={scorer.value}, {elapsed_ms:.1f} ms)"
+        )
+    )
     table.add_column("#", justify="right", style="cyan", no_wrap=True)
     table.add_column("ID", justify="right", style="dim", no_wrap=True)
     table.add_column("Score", justify="right", style="green", no_wrap=True)
@@ -480,6 +544,77 @@ def crawl_cmd(
     )
 
 
+@app.command(name="embed")
+def embed_cmd(
+    index_path: Annotated[Path, typer.Argument(help="Path to a saved findex index file.")],
+    out: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Output .npy path for normalized chunk embeddings."),
+    ] = Path("data/embeddings.npy"),
+    model: Annotated[
+        str,
+        typer.Option("--model", help="Sentence-Transformers model name."),
+    ] = DEFAULT_EMBEDDING_MODEL,
+    chunk_words: Annotated[
+        int,
+        typer.Option("--chunk-words", min=30, help="Target words per passage chunk."),
+    ] = 250,
+    overlap: Annotated[
+        int,
+        typer.Option("--overlap", min=0, help="Word overlap between adjacent chunks."),
+    ] = 40,
+    batch_size: Annotated[
+        int,
+        typer.Option("--batch-size", min=1, help="Encoding batch size."),
+    ] = 64,
+) -> None:
+    """Chunk documents in a persisted index and save L2-normalized embeddings as .npy."""
+    if not index_path.exists():
+        stderr_console.print(f"[red]Error:[/red] Index file not found: {index_path}")
+        raise typer.Exit(code=1)
+
+    t0 = time.perf_counter()
+    embedder = SentenceTransformerEmbedder(model)
+    try:
+        with (
+            open_index(index_path) as ix,
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=stderr_console,
+                transient=True,
+            ) as progress,
+        ):
+            task_id = progress.add_task(f"Embedding ({model})...", total=None)
+
+            def _on_progress(done: int, total: int) -> None:
+                progress.update(task_id, completed=done, total=total)
+
+            sem_ix = build_semantic_index(
+                ix,
+                embedder,
+                chunk_words=chunk_words,
+                overlap_words=overlap,
+                batch_size=batch_size,
+                on_progress=_on_progress,
+            )
+            saved_path = sem_ix.save(out)
+    except (OSError, ValueError, RuntimeError) as exc:
+        stderr_console.print(f"[red]Error:[/red] Embedding failed: {exc}")
+        raise typer.Exit(code=1) from None
+
+    elapsed = time.perf_counter() - t0
+    size_mib = saved_path.stat().st_size / (1024 * 1024)
+    stdout_console.print(
+        f"Embedded [bold]{sem_ix.num_chunks:,}[/bold] chunks "
+        f"(dim={sem_ix.dim}, model={sem_ix.model_name}) -> {saved_path} "
+        f"({size_mib:.2f} MiB, {elapsed:.2f} s)"
+    )
+
+
 @app.command(name="serve")
 def serve_cmd(
     index_path: Annotated[
@@ -509,6 +644,13 @@ def serve_cmd(
             help="Number of uvicorn worker processes (default: WORKERS env or 1).",
         ),
     ] = None,
+    embeddings: Annotated[
+        Path | None,
+        typer.Option(
+            "--embeddings",
+            help="Optional .npy embeddings for semantic/hybrid API (env: EMBEDDINGS_PATH).",
+        ),
+    ] = None,
 ) -> None:
     """Start the FastAPI HTTP search service for a persisted index."""
     import uvicorn
@@ -517,6 +659,7 @@ def serve_cmd(
 
     cfg = Settings()
     resolved_index = index_path if index_path is not None else cfg.index_path
+    resolved_embeddings = embeddings if embeddings is not None else cfg.embeddings_path
     resolved_host = host if host is not None else cfg.host
     resolved_port = port if port is not None else cfg.port
     resolved_workers = workers if workers is not None else cfg.workers
@@ -529,8 +672,13 @@ def serve_cmd(
     if not resolved_index.exists() and not cfg.index_url:
         stderr_console.print(f"[red]Error:[/red] Index file not found: {resolved_index}")
         raise typer.Exit(code=1)
+    if resolved_embeddings is not None and not resolved_embeddings.exists():
+        stderr_console.print(f"[red]Error:[/red] Embeddings file not found: {resolved_embeddings}")
+        raise typer.Exit(code=1)
 
     os.environ["INDEX_PATH"] = str(resolved_index.resolve())
+    if resolved_embeddings is not None:
+        os.environ["EMBEDDINGS_PATH"] = str(resolved_embeddings.resolve())
 
     stdout_console.print(
         f"Serving [bold]{resolved_index}[/bold] at "

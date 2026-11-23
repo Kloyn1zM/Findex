@@ -1,4 +1,4 @@
-"""FastAPI web application factory, Jinja2 views, and REST endpoints (Lab 7)."""
+"""FastAPI web application factory, Jinja2 views, and hybrid REST endpoints (Lab 7–8)."""
 
 import contextlib
 import heapq
@@ -22,8 +22,15 @@ from markupsafe import Markup, escape
 from findex import __version__
 from findex.index import Index
 from findex.query import QuerySyntaxError
-from findex.scoring import BM25, Scorer, TfIdf
+from findex.scoring import BM25, Scorer, SearchResult, TfIdf
 from findex.search import search_paginated
+from findex.semantic import (
+    SemanticIndex,
+    SentenceTransformerEmbedder,
+    TextEmbedder,
+    hybrid_search,
+    semantic_search,
+)
 from findex.store import open_index
 from findex.web.deps import AppState, get_app_state, get_index, get_optional_index
 from findex.web.schemas import (
@@ -32,6 +39,7 @@ from findex.web.schemas import (
     HealthResponse,
     ScorerName,
     SearchHit,
+    SearchMode,
     SearchResponse,
     StatsResponse,
     TermStat,
@@ -90,19 +98,85 @@ def download_index_file(
     return dest
 
 
+def _execute_paginated_query(
+    ix: Index,
+    state: AppState,
+    query: str,
+    *,
+    mode: SearchMode,
+    scorer: Scorer,
+    page: int,
+    page_size: int,
+) -> tuple[list[SearchResult], int]:
+    """Run keyword, semantic, or hybrid search and return (page_results, total_hits)."""
+    if mode == "keyword":
+        return search_paginated(ix, query, scorer=scorer, page=page, page_size=page_size)
+
+    if state.semantic is None or state.embedder is None:
+        raise ValueError(
+            "Semantic embeddings not loaded; start server with --embeddings or EMBEDDINGS_PATH"
+        )
+
+    offset = (page - 1) * page_size
+    fetch_k = offset + page_size
+
+    if mode == "semantic":
+        total_docs = len({int(d) for d in state.semantic.chunk_doc_ids.tolist()})
+        if offset >= total_docs:
+            return [], total_docs
+        all_up_to = semantic_search(
+            ix,
+            state.semantic,
+            state.embedder,
+            query,
+            k=min(total_docs, fetch_k),
+        )
+        return all_up_to[offset : offset + page_size], total_docs
+
+    pool_limit = max(fetch_k, ix.num_docs)
+    all_hybrid = hybrid_search(
+        ix,
+        state.semantic,
+        state.embedder,
+        query,
+        scorer=scorer,
+        k=pool_limit,
+    )
+    total = len(all_hybrid)
+    return all_hybrid[offset : offset + page_size], total
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     preloaded_index: Index | None = None,
+    preloaded_semantic: SemanticIndex | None = None,
+    embedder: TextEmbedder | None = None,
 ) -> FastAPI:
-    """Create a configured FastAPI app loading its index from Settings.index_path."""
+    """Create a configured FastAPI app loading index and optional embeddings from Settings."""
     cfg = settings if settings is not None else Settings()
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+    def _init_semantic(state: AppState) -> None:
+        if preloaded_semantic is not None:
+            state.semantic = preloaded_semantic
+            state.embedder = embedder or SentenceTransformerEmbedder(preloaded_semantic.model_name)
+        elif cfg.embeddings_path is not None:
+            loaded_sem = SemanticIndex.load(cfg.embeddings_path)
+            state.semantic = loaded_sem
+            state.embedder = embedder or SentenceTransformerEmbedder(loaded_sem.model_name)
+            log.info(
+                "Loaded semantic index (%d chunks, dim=%d, model=%s)",
+                loaded_sem.num_chunks,
+                loaded_sem.dim,
+                loaded_sem.model_name,
+            )
 
     @asynccontextmanager
     async def lifespan(app_instance: FastAPI) -> AsyncGenerator[None]:
         state = AppState(started_at=time.perf_counter())
         app_instance.state.findex = state
+        _init_semantic(state)
 
         if preloaded_index is not None:
             state.index = preloaded_index
@@ -111,6 +185,8 @@ def create_app(
                 yield
             finally:
                 state.index = None
+                state.semantic = None
+                state.embedder = None
             return
 
         if cfg.index_path is None:
@@ -129,12 +205,16 @@ def create_app(
                 yield
             finally:
                 state.index = None
+                state.semantic = None
+                state.embedder = None
         log.info("Index closed cleanly on shutdown")
 
     app = FastAPI(
         title="findex Search API",
         version=__version__,
-        description="Full-text search service with BM25/TF-IDF ranking, pagination, and Jinja2 UI.",
+        description=(
+            "Full-text and hybrid semantic search service (BM25, TF-IDF, RRF, pagination, Jinja2)."
+        ),
         lifespan=lifespan,
         responses={500: {"model": ErrorResponse}},
     )
@@ -183,7 +263,9 @@ def create_app(
     def search_page(
         request: Request,
         ix: Annotated[Index | None, Depends(get_optional_index)],
+        state: Annotated[AppState, Depends(get_app_state)],
         q: Annotated[str, Query()] = "",
+        mode: Annotated[SearchMode, Query()] = "keyword",
         scorer: Annotated[ScorerName, Query()] = "bm25",
         k: Annotated[int, Query(ge=1, le=50)] = 10,
         page: Annotated[int, Query(ge=1, le=1000)] = 1,
@@ -201,20 +283,24 @@ def create_app(
             active_scorer: Scorer = BM25() if scorer == "bm25" else TfIdf()
             t0 = time.perf_counter()
             try:
-                results, total = search_paginated(
+                results, total = _execute_paginated_query(
                     ix,
+                    state,
                     query_clean,
+                    mode=mode,
                     scorer=active_scorer,
                     page=page,
                     page_size=k,
                 )
-            except (QuerySyntaxError, ValueError) as exc:
+            except (QuerySyntaxError, ValueError, RuntimeError) as exc:
                 error_msg = str(exc)
             else:
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 total_pages = math.ceil(total / k) if total > 0 else 0
                 offset = (page - 1) * k
-                back_qs = urlencode({"q": query_clean, "scorer": scorer, "k": k, "page": page})
+                back_qs = urlencode(
+                    {"q": query_clean, "mode": mode, "scorer": scorer, "k": k, "page": page}
+                )
                 for idx, res in enumerate(results, start=1):
                     hits_view.append(
                         {
@@ -228,12 +314,12 @@ def create_app(
                     )
 
         prev_url = (
-            _build_query_url("/", q=query_clean, scorer=scorer, k=k, page=page - 1)
+            _build_query_url("/", q=query_clean, mode=mode, scorer=scorer, k=k, page=page - 1)
             if page > 1 and total_pages > 0
             else None
         )
         next_url = (
-            _build_query_url("/", q=query_clean, scorer=scorer, k=k, page=page + 1)
+            _build_query_url("/", q=query_clean, mode=mode, scorer=scorer, k=k, page=page + 1)
             if page < total_pages
             else None
         )
@@ -244,9 +330,11 @@ def create_app(
             context={
                 "version": __version__,
                 "index_ready": ix is not None,
+                "semantic_ready": state.semantic is not None,
                 "num_docs": ix.num_docs if ix is not None else 0,
                 "vocab_size": len(ix) if ix is not None else 0,
                 "q": q,
+                "mode": mode,
                 "scorer": scorer,
                 "k": k,
                 "page": page,
@@ -266,12 +354,15 @@ def create_app(
         doc_id: int,
         ix: Annotated[Index, Depends(get_index)],
         q: Annotated[str, Query()] = "",
+        mode: Annotated[SearchMode, Query()] = "keyword",
         scorer: Annotated[ScorerName, Query()] = "bm25",
         k: Annotated[int, Query(ge=1, le=50)] = 10,
         page: Annotated[int, Query(ge=1, le=1000)] = 1,
     ) -> HTMLResponse:
         back_url = (
-            _build_query_url("/", q=q.strip(), scorer=scorer, k=k, page=page) if q.strip() else "/"
+            _build_query_url("/", q=q.strip(), mode=mode, scorer=scorer, k=k, page=page)
+            if q.strip()
+            else "/"
         )
         meta = ix.doc_meta.get(doc_id)
         if meta is None:
@@ -308,14 +399,17 @@ def create_app(
             num_docs=ix.num_docs,
             vocab_size=len(ix),
             uptime_sec=round(uptime, 3),
+            semantic_ready=state.semantic is not None,
         )
 
     @app.get("/search", response_model=SearchResponse)
     def search_endpoint(
         ix: Annotated[Index, Depends(get_index)],
-        q: Annotated[str, Query(min_length=1, description="Boolean or phrase search query")],
+        state: Annotated[AppState, Depends(get_app_state)],
+        q: Annotated[str, Query(min_length=1, description="Boolean, phrase, or natural query")],
         k: Annotated[int, Query(ge=1, le=100, description="Results per page")] = 10,
-        scorer: Annotated[ScorerName, Query(description="Ranking algorithm")] = "bm25",
+        scorer: Annotated[ScorerName, Query(description="Keyword ranking algorithm")] = "bm25",
+        mode: Annotated[SearchMode, Query(description="Search mode")] = "keyword",
         page: Annotated[int, Query(ge=1, le=1000, description="1-based page number")] = 1,
     ) -> SearchResponse:
         if not q.strip():
@@ -324,14 +418,16 @@ def create_app(
         active_scorer: Scorer = BM25() if scorer == "bm25" else TfIdf()
         t0 = time.perf_counter()
         try:
-            results, total = search_paginated(
+            results, total = _execute_paginated_query(
                 ix,
+                state,
                 q,
+                mode=mode,
                 scorer=active_scorer,
                 page=page,
                 page_size=k,
             )
-        except (QuerySyntaxError, ValueError) as exc:
+        except (QuerySyntaxError, ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -349,6 +445,7 @@ def create_app(
         ]
         return SearchResponse(
             query=q,
+            mode=mode,
             scorer=scorer,
             k=k,
             page=page,

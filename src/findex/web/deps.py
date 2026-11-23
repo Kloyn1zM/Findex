@@ -1,4 +1,4 @@
-"""FastAPI dependency providers for the findex web application (Lab 7)."""
+"""FastAPI dependency providers for the findex web application (Lab 7–8)."""
 
 from dataclasses import dataclass
 from typing import Annotated
@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 
 from findex.index import Index
+from findex.semantic import SemanticIndex, TextEmbedder
 
 
 @dataclass(slots=True)
@@ -13,6 +14,8 @@ class AppState:
     """Mutable runtime container attached to app.state during lifespan."""
 
     index: Index | None = None
+    semantic: SemanticIndex | None = None
+    embedder: TextEmbedder | None = None
     started_at: float = 0.0
 
 

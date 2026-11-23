@@ -1,4 +1,4 @@
-"""Environment-driven web service configuration via pydantic-settings (Lab 7)."""
+"""Environment-driven web service configuration via pydantic-settings (Lab 7–8)."""
 
 from pathlib import Path
 
@@ -21,6 +21,10 @@ class Settings(BaseSettings):
             "Optional URL to download the index file on startup when INDEX_PATH is absent "
             "(env: INDEX_URL)."
         ),
+    )
+    embeddings_path: Path | None = Field(
+        default=None,
+        description="Optional path to .npy semantic embeddings (env: EMBEDDINGS_PATH).",
     )
     host: str = Field(
         default="127.0.0.1",

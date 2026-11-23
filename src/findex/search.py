@@ -20,10 +20,12 @@ from findex.scoring import BM25, Scorer, SearchResult, TfIdf, make_snippet
 from findex.store import open_index
 from findex.timing import timed
 from findex.tokenize import tokenize
+from findex.vectorized import score_vectorized
 
 log = logging.getLogger(__name__)
 
 SearchEngine = Literal["merge", "set"]
+ScoringBackend = Literal["numpy", "python"]
 
 _INDEX_REGISTRY: dict[int, weakref.ref[Index]] = {}
 
@@ -117,6 +119,7 @@ def _compute_ranked_ids(
     query: str,
     scorer: Scorer,
     k: int,
+    backend: ScoringBackend = "numpy",
 ) -> tuple[tuple[int, float], ...]:
     """Parse query, evaluate matched documents, score them, and return top-k (doc_id, score)."""
     if k <= 0 or not query.strip():
@@ -130,6 +133,9 @@ def _compute_ranked_ids(
     pos_terms = tree.positive_terms()
     if not pos_terms:
         return tuple((doc_id, 0.0) for doc_id in matched_ids[:k])
+
+    if backend == "numpy" and isinstance(scorer, (BM25, TfIdf)):
+        return score_vectorized(index, pos_terms, matched_ids, scorer, k)
 
     allowed = set(matched_ids)
     scores: defaultdict[int, float] = defaultdict(float)
@@ -151,12 +157,13 @@ def _cached_ranked_ids(
     query: str,
     scorer: Scorer,
     k: int,
+    backend: ScoringBackend = "numpy",
 ) -> tuple[tuple[int, float], ...]:
     ref = _INDEX_REGISTRY.get(cache_token)
     index = ref() if ref is not None else None
     if index is None:
         return ()
-    return _compute_ranked_ids(index, query, scorer, k)
+    return _compute_ranked_ids(index, query, scorer, k, backend=backend)
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +201,7 @@ def search(
     k: int = 10,
     highlight_start: str = "**",
     highlight_end: str = "**",
+    backend: ScoringBackend = "numpy",
 ) -> list[SearchResult]:
     """Run a parsed, ranked search returning top-k SearchResult objects with snippets."""
     active_scorer: Scorer = scorer if scorer is not None else BM25()
@@ -210,12 +218,12 @@ def search(
     if is_hashable:
         _INDEX_REGISTRY[index.cache_token] = weakref.ref(index)
         before_hits = _cached_ranked_ids.cache_info().hits
-        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, k)
+        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, k, backend)
         after_hits = _cached_ranked_ids.cache_info().hits
         if after_hits > before_hits:
             log.debug("search cache HIT for query=%r (%s)", query, _cached_ranked_ids.cache_info())
     else:
-        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, k)
+        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, k, backend=backend)
 
     pos_terms = parse_query(query).positive_terms()
     results: list[SearchResult] = []
@@ -247,6 +255,7 @@ def search_paginated(
     page_size: int = 10,
     highlight_start: str = "**",
     highlight_end: str = "**",
+    backend: ScoringBackend = "numpy",
 ) -> tuple[list[SearchResult], int]:
     """Run a ranked search returning (page_results, total_matching_docs)."""
     active_scorer: Scorer = scorer if scorer is not None else BM25()
@@ -273,9 +282,9 @@ def search_paginated(
 
     if is_hashable:
         _INDEX_REGISTRY[index.cache_token] = weakref.ref(index)
-        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, fetch_k)
+        ranked_pairs = _cached_ranked_ids(index.cache_token, query, active_scorer, fetch_k, backend)
     else:
-        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, fetch_k)
+        ranked_pairs = _compute_ranked_ids(index, query, active_scorer, fetch_k, backend=backend)
 
     page_pairs = ranked_pairs[offset : offset + page_size]
     pos_terms = tree.positive_terms()

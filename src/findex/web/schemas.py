@@ -1,10 +1,11 @@
-"""Pydantic v2 HTTP boundary schemas for the findex web API (Lab 7)."""
+"""Pydantic v2 HTTP boundary schemas for the findex web API (Lab 7–8)."""
 
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 ScorerName = Literal["bm25", "tfidf"]
+SearchMode = Literal["keyword", "semantic", "hybrid"]
 
 
 class HealthResponse(BaseModel):
@@ -15,6 +16,7 @@ class HealthResponse(BaseModel):
     num_docs: int
     vocab_size: int
     uptime_sec: float
+    semantic_ready: bool = False
 
 
 class SearchHit(BaseModel):
@@ -31,6 +33,7 @@ class SearchResponse(BaseModel):
     """Paginated ranked search API payload."""
 
     query: str
+    mode: SearchMode = "keyword"
     scorer: ScorerName
     k: int = Field(ge=1)
     page: int = Field(ge=1)

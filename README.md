@@ -1,39 +1,59 @@
-# findex — Full-Text & Semantic Search Engine
+# findex (`v1.0.0`)
 
 [![CI](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml/badge.svg)](https://github.com/Kloyn1zM/Findex/actions/workflows/ci.yml)
 
+A full-text and hybrid semantic search engine built from scratch in Python 3.13 — from streaming inverted-index construction and binary persistence to async crawling, FastAPI + Jinja2 serving, NumPy-vectorized BM25, and Reciprocal Rank Fusion over dense embeddings.
+
 **Live Demo:** [https://findex-1vdd.onrender.com/](https://findex-1vdd.onrender.com/)
 
-A full-text search engine built incrementally in Python (3.13+, `uv`, `ruff`, `pyright`, `pytest`) from a constant-memory streaming corpus pipeline to a parallel inverted index, ranked query engine, installable CLI, async web crawler, and FastAPI web service.
+![findex search demo](docs/demo.gif)
 
-## Corpus
+### Headline Numbers
+- **Corpus indexed**: **5,000** Simple English Wikipedia articles (**129,327** unique terms, **19,789** semantic chunks)
+- **HTTP API p95 latency (Lab 7)**: **`208.7 ms` p95** at **130.1 req/s** (`4` workers, `20` concurrent mixed queries, `0` errors)
+- **Peak scoring speedup (Lab 8 M2)**: **53.6×** faster BM25 (`13.405 ms → 0.250 ms` on common terms via NumPy `int32` ufuncs + `np.argpartition`, 100% identical ranking)
+- **Hybrid retrieval quality (Lab 8 M3)**: **0.880** mean `P@5` across 15 queries (**0.120 → 0.840** on paraphrase queries via `all-MiniLM-L6-v2` + RRF)
 
-The corpus consists of **5,000 articles** from **Simple English Wikipedia** (`wikimedia/wikipedia`, snapshot `20231101.simple` on Hugging Face), filtered to articles with at least 600 characters and stored as 40 sharded JSON-lines files (`data/wiki_00.jsonl` – `data/wiki_39.jsonl`, **23.47 MiB** total).
+### Architecture
 
-`data/` is excluded via `.gitignore`. To reproduce the corpus locally:
+~~~mermaid
+flowchart LR
+  C["Corpus / JSONL<br/>(Lab 1)"] --> T["Tokenizer &amp; Spans<br/>(Lab 1–2)"]
+  W["Async Crawler<br/>httpx + TaskGroup<br/>(Lab 6)"] --> C
+  T --> P["Parallel Indexer<br/>ProcessPool / 3.13t<br/>(Lab 5)"]
+  P --> S["Binary / Pickle Store<br/>+ int32 Arrays<br/>(Lab 2, Lab 8)"]
+  S --> KW["Vectorized BM25 / TF-IDF<br/>NumPy + argpartition<br/>(Lab 3, Lab 8)"]
+  S --> EMB["Chunk Embedder<br/>all-MiniLM-L6-v2 → .npy<br/>(Lab 8)"]
+  EMB --> SEM["Dense Search<br/>E @ q + Best-Chunk<br/>(Lab 8)"]
+  KW --> RRF["Hybrid RRF Fusion<br/>Σ 1/(60 + rank)<br/>(Lab 8)"]
+  SEM --> RRF
+  RRF --> CLI["Typer + Rich CLI<br/>(Lab 4)"]
+  RRF --> API["FastAPI + Web UI<br/>(Lab 7–8)"]
+~~~
+
+### Consolidated Benchmarks (Labs 1–8)
+
+| Stage | Capability | Key Measured Result |
+|---|---|---|
+| **Lab 1–2** | Streaming pipeline & binary index | `5,000` docs, `129,327` terms, custom binary `array('I')` & `pickle` persistence |
+| **Lab 3** | Query AST, phrases, BM25 / TF-IDF | Ranked search with highlighted snippets and LRU query caching |
+| **Lab 4** | Packaged CLI (`typer` + `rich`) & CI | Strict `ruff` + `pyright` + `pytest` pipeline in GitHub Actions |
+| **Lab 5** | Parallel indexing (`GIL` vs `3.13t`) | Multi-process & free-threaded benchmarks across workers |
+| **Lab 6** | Polite async web crawler | `13.96 pages/s` (`c=5`), `0` errors on 200 pages, flat `63.5–66.4 MiB` RSS |
+| **Lab 7** | FastAPI + Jinja2 + Docker (`findex.web`) | `130.1 req/s`, `208.7 ms` p95 (`4` workers, `c=20`), `0` errors |
+| **Lab 8** | NumPy BM25 + Semantic Hybrid RRF | **53.6×** BM25 speedup; **0.880** overall `P@5` (**0.840** on paraphrases) |
+
+### Quick Start
 
 ~~~bash
-uv run --with datasets python -c "
-import json
-from pathlib import Path
-from datasets import load_dataset
-out = Path('data'); out.mkdir(exist_ok=True)
-ds = load_dataset('wikimedia/wikipedia', '20231101.simple', split='train', streaming=True)
-count, shard = 0, 0
-fh = (out / f'wiki_{shard:02d}.jsonl').open('w', encoding='utf-8')
-try:
-    for row in ds:
-        text = row['text'].strip()
-        if len(text) < 600: continue
-        fh.write(json.dumps({'id': row['id'], 'url': row['url'], 'title': row['title'], 'text': text}, ensure_ascii=False) + '\n')
-        count += 1
-        if count >= 5000: break
-        if count % 125 == 0:
-            fh.close(); shard += 1
-            fh = (out / f'wiki_{shard:02d}.jsonl').open('w', encoding='utf-8')
-finally:
-    fh.close()
-"
+uv sync                              # core engine, CLI, crawler, FastAPI
+uv sync --extra semantic             # optional: sentence-transformers for embeddings
+
+findex index data/ --out data/index.bin --positions
+findex search data/index.bin "programming language" --k 5
+findex embed data/index.bin --out data/embeddings.npy --model all-MiniLM-L6-v2
+findex search data/index.bin "celestial bodies orbiting our star" --mode hybrid --embeddings data/embeddings.npy
+findex serve data/index.bin --embeddings data/embeddings.npy --port 8000
 ~~~
 
 ---
@@ -433,3 +453,85 @@ curl "http://127.0.0.1:8000/search?q=python&k=5&page=1&scorer=bm25"
 curl "http://127.0.0.1:8000/docs/1570"
 curl "http://127.0.0.1:8000/health"
 ~~~
+
+---
+
+## Lab 08 — Profiling, NumPy Vectorization & Hybrid Semantic Search (`v1.0.0`)
+
+### M1 — Baseline Profiling & Regression Benchmarks
+- Captured `cProfile` call profiles and `py-spy` SVG flame graphs (`250 Hz`, 0 errors) on the full 5,000-doc index **before** making any optimizations:
+  - [`docs/lab08_search.svg`](docs/lab08_search.svg) (2,139 samples)
+  - [`docs/lab08_index.svg`](docs/lab08_index.svg) (2,671 samples)
+  - Full top-3 hotspot breakdown, Python-vs-native split, hypotheses, and post-patch outcomes: [`docs/lab08_profile.md`](docs/lab08_profile.md)
+- Added `pytest-benchmark` regression tests (`tests/test_benchmarks.py`) executed in CI for both `build_index` and `search`.
+
+### M2 — Vectorized BM25 & TF-IDF (`src/findex/vectorized.py`)
+- Packed postings into contiguous NumPy `int32` arrays (`doc_ids`, `tfs`) and document lengths into a single `int32[N]` array.
+- Replaced Lab 3's per-posting Python loop with ufunc expressions, fancy indexing (`doc_lengths[doc_ids]`), and $O(n)$ `np.argpartition` top-k selection.
+- Verified **100% identical top-10 ranking and scores** against the Lab 3 Python scorer (`tests/test_vectorized.py`, 24 parametrized cases).
+
+**BM25 Speedup (5,000 docs, median of 30 runs):**
+
+| Query | Docs matched | Lab 3 Python (ms) | Lab 8 NumPy (ms) | Speedup | Identical top-10? |
+|---|---:|---:|---:|---:|---|
+| Common term (`the`) | 4,981 | 13.405 | 0.250 | **53.6×** | yes |
+| Medium term (`world`) | 1,938 | 5.218 | 0.221 | **23.6×** | yes |
+| Rare term (`aachen`) | 10 | 0.045 | 0.053 | **0.85×** | yes |
+| 3-term AND (`world war europe`) | 270 | 3.002 | 1.048 | **2.9×** | yes |
+| 3-term OR (`world OR war OR europe`) | 2,444 | 10.970 | 1.409 | **7.8×** | yes |
+
+**TF-IDF Speedup (5,000 docs, median of 30 runs):**
+
+| Query | Docs matched | Lab 3 Python (ms) | Lab 8 NumPy (ms) | Speedup | Identical top-10? |
+|---|---:|---:|---:|---:|---|
+| Common term (`the`) | 4,981 | 9.218 | 0.233 | **39.6×** | yes |
+| Medium term (`world`) | 1,938 | 3.796 | 0.131 | **28.9×** | yes |
+| Rare term (`aachen`) | 10 | 0.035 | 0.037 | **0.95×** | yes |
+| 3-term AND (`world war europe`) | 270 | 2.402 | 1.007 | **2.4×** | yes |
+| 3-term OR (`world OR war OR europe`) | 2,444 | 7.661 | 1.375 | **5.6×** | yes |
+
+**Why speedup varies by query:**
+- Large postings lists (`the`, `world`) move thousands of CPython bytecode iterations, attribute lookups, and float boxings into a single contiguous C/SIMD pass (**23.6×–53.6×**).
+- On a rare term with only 10 matching documents (`aachen`), NumPy's C-call dispatch and small temporary array allocations cost slightly more than a 10-iteration Python loop (**0.85×–0.95×**).
+- Multi-term Boolean queries spend part of their time in AST parsing and postings-list intersection (`merge_and` / `merge_or`), moderating end-to-end speedup to **2.4×–7.8×**.
+
+### M3 — Semantic Embeddings & Hybrid Search (`src/findex/semantic.py`)
+- Added `findex embed` to split documents into overlapping 250-word passages (`overlap=40`), encode them with `all-MiniLM-L6-v2` (optional `[semantic]` extra), L2-normalize once, and persist `E: float32[19789, 384]` (`28.99 MiB`) plus `chunk_doc_ids: int32[19789]` as `.npy`.
+- Semantic retrieval runs a single matrix-vector dot product `E @ q`, aggregates the best chunk per document (`np.maximum.at`), and selects top-k via `np.argpartition`.
+- Hybrid mode fuses keyword BM25 and semantic rankings via **Reciprocal Rank Fusion** (`Σ 1 / (60 + rank)`), exposed via `--mode keyword|semantic|hybrid` in CLI, `?mode=...` in FastAPI, and the mode dropdown in the web UI.
+
+**15-Query Precision@5 Evaluation (10 keyword-oriented + 5 paraphrase queries):**
+
+| Type | Query | Keyword P@5 | Semantic P@5 | Hybrid (RRF) P@5 |
+|---|---|---:|---:|---:|
+| orig | `programming language` | 0.80 | 1.00 | 1.00 |
+| orig | `solar system planets` | 1.00 | 1.00 | 1.00 |
+| orig | `world war europe` | 0.80 | 0.60 | 0.60 |
+| orig | `dna genetics cell` | 1.00 | 1.00 | 1.00 |
+| orig | `ancient egypt pharaoh` | 0.80 | 1.00 | 0.80 |
+| orig | `albert einstein relativity` | 0.80 | 0.80 | 1.00 |
+| orig | `linux operating system` | 1.00 | 1.00 | 1.00 |
+| orig | `jazz music instruments` | 1.00 | 1.00 | 1.00 |
+| orig | `olympic games sport` | 1.00 | 0.80 | 1.00 |
+| orig | `volcano earthquake tectonic` | 0.00 | 0.60 | 0.60 |
+| paraphrase | `how living organisms pass traits to offspring` | 0.40 | 0.80 | 0.80 |
+| paraphrase | `celestial bodies orbiting our star` | 0.00 | 1.00 | 1.00 |
+| paraphrase | `molten rock erupting from mountains` | 0.00 | 0.80 | 0.80 |
+| paraphrase | `ancient rulers buried in triangular tombs` | 0.20 | 0.60 | 0.60 |
+| paraphrase | `human-made instructions telling computers what to do` | 0.00 | 1.00 | 1.00 |
+| **Mean** | **Original 10** | **0.820** | **0.880** | **0.900** |
+| **Mean** | **Paraphrase 5** | **0.120** | **0.840** | **0.840** |
+| **Mean** | **All 15 queries** | **0.587** | **0.867** | **0.880** |
+
+**Interpretation:**
+- Pure BM25 works well on exact terminology (`0.820` on the original 10) but collapses to **`0.120`** on paraphrases — returning zero hits whenever implicit AND requires a word absent from the article (e.g., *"celestial bodies orbiting our star"*).
+- Semantic search resolves vocabulary mismatch (`0.840` on paraphrases) but can drift slightly on exact named-entity combinations (e.g., `olympic games sport`: `0.80` vs BM25's `1.00`).
+- **Hybrid RRF achieves the highest score overall (`0.880`) and on the original 10 (`0.900`)**, combining BM25's lexical precision with dense semantic recall without having to calibrate incompatible raw score scales.
+
+---
+
+## Honest Limitations & Next Steps
+- **Brute-force vector scan (`E @ q`)**: takes milliseconds on `19,789` chunks (`29 MiB`), but scaling past ~1M chunks requires an approximate nearest-neighbor index (HNSW via `faiss` or `hnswlib`) to keep memory and latency bounded.
+- **Full-index rebuilds**: indexing and embedding are currently batch operations rather than incremental; supporting append-only segments / delta re-embedding would enable live corpus updates.
+- **Single-process HTTP serving & free-tier RAM limits**: on a single `uvicorn` worker under `concurrency=20`, GIL contention limits throughput (`77.6–84.5 req/s`); scaling locally to `--workers 4` lifts throughput to **`130.1 req/s`** (`208.7 ms` p95). On Render's 512 MiB free tier, the live demo runs 1 worker over a 1,500-doc deployment index (`index_deploy.bin`, `~191 MiB` Peak RSS on `v1.0.0` with NumPy) in keyword mode, since loading PyTorch + `all-MiniLM-L6-v2` exceeds 512 MiB RAM; scaling semantic/hybrid search in production requires a dedicated instance or quantized ONNX inference with `np.memmap`.
+- **No stemming / lemmatization**: keyword search relies on Unicode casefolding + regex tokenization; adding language-aware stemming (or leaning on hybrid mode) further improves lexical recall.
